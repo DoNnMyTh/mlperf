@@ -1,0 +1,29 @@
+ClusterName={{ cluster_name }}
+ControlMachine={{ control_machine }}
+SlurmUser=slurm
+SlurmdUser=root
+AuthType=auth/munge
+CryptoType=crypto/munge
+MpiDefault=pmix
+ProctrackType=proctrack/cgroup
+ReturnToService=2
+SlurmctldPidFile=/var/run/slurmctld.pid
+SlurmdPidFile=/var/run/slurmd.pid
+SlurmctldPort=6817
+SlurmdPort=6818
+SlurmdSpoolDir=/var/spool/slurmd
+StateSaveLocation=/var/spool/slurmctld
+SwitchType=switch/none
+TaskPlugin=task/cgroup,task/affinity
+SchedulerType=sched/backfill
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+GresTypes=gpu
+AccountingStorageTRES=gres/gpu
+
+{% for host in groups['compute'] %}
+NodeName={{ host }} CPUs={{ hostvars[host].ansible_processor_vcpus | default(128) }} RealMemory={{ (hostvars[host].ansible_memtotal_mb | default(1048576)) - 8192 }} Gres=gpu:{{ accelerator_type }}:{{ hostvars[host].gpus | default(gpus_per_node) }} State=UNKNOWN
+{% endfor %}
+
+PartitionName={{ cluster_name }} Nodes={{ groups['compute'] | join(',') }} Default=YES MaxTime={{ partition_max_time }} State=UP
+Include=/etc/slurm/plugstack.conf.d/*.conf

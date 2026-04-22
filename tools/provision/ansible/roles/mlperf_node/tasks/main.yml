@@ -1,0 +1,27 @@
+---
+# Role: mlperf_node — runs bootstrap_node.sh on every host.
+# The bash script is idempotent; this role simply stages and executes it.
+
+- name: Ensure /usr/local/sbin exists
+  ansible.builtin.file:
+    path: /usr/local/sbin
+    state: directory
+    mode: "0755"
+
+- name: Stage bootstrap_node.sh on remote host
+  ansible.builtin.copy:
+    src: "../../bootstrap_node.sh"   # relative to role files/; adjust if running from the repo checkout
+    dest: /usr/local/sbin/mlperf-bootstrap-node
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Run bootstrap_node.sh
+  ansible.builtin.command: /usr/local/sbin/mlperf-bootstrap-node
+  register: bootstrap_result
+  changed_when: "'Bootstrap complete.' in bootstrap_result.stdout"
+  failed_when: bootstrap_result.rc != 0
+  args:
+    creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  # "creates" makes the task skip when the repo file already exists; full
+  # idempotency is enforced inside the bash script itself.

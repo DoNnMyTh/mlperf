@@ -1,0 +1,27 @@
+---
+# MLPerf cluster configuration — copy to all.yml and edit.
+
+cluster_name: mlperf
+control_machine: "{{ groups['head'][0] }}"
+
+# GPUs per compute node (default; override per-host via inventory).
+gpus_per_node: 8
+
+# Accelerator type for Slurm Gres (h100 | h200 | b200 | gb200 | gb300).
+accelerator_type: h200
+
+# Partition time limit.
+partition_max_time: "24:00:00"
+
+# Slurm version to install (matches bootstrap_node.sh).
+slurm_version: "23.11.6"
+
+# Pyxis version (matches bootstrap_node.sh).
+pyxis_version: "0.20.0"
+
+# Enroot version.
+enroot_version: "3.5.0"
+
+# Additional kernel tuning knobs.
+kernel_nr_hugepages: 1024
+kernel_memlock_unlimited: true

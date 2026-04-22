@@ -1,0 +1,33 @@
+---
+# Role: slurm_head — render slurm.conf on the head node and (re)start slurmctld.
+
+- name: Render /etc/slurm/slurm.conf
+  ansible.builtin.template:
+    src: slurm.conf.j2
+    dest: /etc/slurm/slurm.conf
+    owner: slurm
+    group: slurm
+    mode: "0644"
+    backup: true
+  notify: restart slurmctld
+
+- name: Enable + start slurmctld
+  ansible.builtin.service:
+    name: slurmctld
+    enabled: true
+    state: started
+
+- name: Install Slurm plugstack for Pyxis
+  ansible.builtin.copy:
+    dest: /etc/slurm/plugstack.conf.d/pyxis.conf
+    content: "required /usr/local/share/pyxis/pyxis.conf\n"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart slurmctld
+
+- name: Ensure /etc/slurm/plugstack.conf.d exists
+  ansible.builtin.file:
+    path: /etc/slurm/plugstack.conf.d
+    state: directory
+    mode: "0755"
