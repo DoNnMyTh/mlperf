@@ -88,8 +88,12 @@ say "Cloning fork"
 gh repo clone "$FORK" "$WORK/fork" -- --branch "$UPSTREAM_BRANCH" || die "clone failed"
 cd "$WORK/fork"
 git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || true
-git fetch upstream "$UPSTREAM_BRANCH" --depth=1 || true
-git checkout -B "$BRANCH" "upstream/$UPSTREAM_BRANCH" 2>/dev/null || git checkout -B "$BRANCH"
+# Fetch upstream base branch; abort if it is unreachable — creating the branch
+# from the fork's (possibly stale) HEAD would put unrelated commits in the PR.
+git fetch upstream "$UPSTREAM_BRANCH" --depth=1 \
+    || die "Failed to fetch upstream/$UPSTREAM_BRANCH. Check network / repo access."
+git checkout -B "$BRANCH" "upstream/$UPSTREAM_BRANCH" \
+    || die "Failed to branch from upstream/$UPSTREAM_BRANCH."
 
 say "Copying submission tree"
 mkdir -p "$SUBMITTER"

@@ -54,10 +54,15 @@ if (( HAS_NVSWITCH == 1 )); then
         info "nvidia-fabricmanager already running."
     else
         if [[ "$PKG" == "apt-get" ]]; then
+            # APT packaging: nvidia-fabricmanager-<cuda-major-minor>
             pkg_update
             pkg_install "nvidia-fabricmanager-$CUDA_VERSION_SUFFIX" || die "FM install failed"
         else
-            pkg_install "nvidia-fabricmanager-$CUDA_VERSION_SUFFIX"
+            # dnf/yum packaging ships either nvidia-fabric-manager (driver repo)
+            # or cuda-drivers-fabricmanager-<cuda> on newer repos. Try both.
+            pkg_install "cuda-drivers-fabricmanager-$CUDA_VERSION_SUFFIX" \
+                || pkg_install nvidia-fabric-manager \
+                || die "FM install failed (tried cuda-drivers-fabricmanager-$CUDA_VERSION_SUFFIX and nvidia-fabric-manager)"
         fi
         $SUDO systemctl enable --now nvidia-fabricmanager
         info "Started nvidia-fabricmanager."
@@ -89,9 +94,14 @@ else
             tar -xzf "$TMP/ofed.tgz" -C "$TMP"
             INSTALLER="$(find "$TMP" -maxdepth 2 -name mlnxofedinstall -print -quit)"
             [[ -n "$INSTALLER" ]] || die "mlnxofedinstall not found in archive."
-            yesno "Run '$INSTALLER --force' now? (rebuilds initramfs, ~10 min)" y \
-                && $SUDO "$INSTALLER" --force \
-                || info "Skipped. Installer at $INSTALLER"
+            if yesno "Run '$INSTALLER --force' now? (rebuilds initramfs, ~10 min)" y; then
+                if ! $SUDO "$INSTALLER" --force; then
+                    rm -rf "$TMP"
+                    die "mlnxofedinstall failed"
+                fi
+            else
+                info "Skipped. Installer at $INSTALLER"
+            fi
             rm -rf "$TMP"
             ;;
         2)

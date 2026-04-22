@@ -85,10 +85,18 @@ case "$FSTYPE" in
         fi
         MGMTD="$(ask_req 'BeeGFS management node (host:port)')"
         $SUDO /opt/beegfs/sbin/beegfs-setup-client -m "$MGMTD" -n beegfs
-        # beegfs uses its own autostart; not /etc/fstab
-        $SUDO systemctl enable --now beegfs-helperd beegfs-client
-        info "BeeGFS client service enabled. Mount appears at /mnt/beegfs by default."
-        info "If you need a different path, edit /etc/beegfs/beegfs-mounts.conf."
+        # beegfs-helperd is always a service.
+        $SUDO systemctl enable --now beegfs-helperd \
+            || warn "beegfs-helperd not enabled — check 'systemctl status beegfs-helperd'."
+        # beegfs-client unit *name* varies: newer distros ship 'beegfs-client.service'
+        # driven by /etc/beegfs/beegfs-mounts.conf; older distros use '@'-templated
+        # instances (beegfs-client@<id>.service). Try the canonical unit first.
+        if systemctl list-unit-files | grep -qE '^beegfs-client\.service'; then
+            $SUDO systemctl enable --now beegfs-client
+        else
+            warn "beegfs-client.service not found. Configure /etc/beegfs/beegfs-mounts.conf and start the correct unit manually."
+        fi
+        info "BeeGFS client configured. Mount appears per /etc/beegfs/beegfs-mounts.conf (default: /mnt/beegfs)."
         exit 0
         ;;
     cifs)
@@ -97,11 +105,16 @@ case "$FSTYPE" in
         CRED_FILE="/etc/cifs-mlperf.cred"
         yesno "Store credentials in $CRED_FILE (0600)?" y || die "Aborted."
         read -rsp 'SMB password: ' PASS; echo
-        $SUDO bash -c "cat > $CRED_FILE" <<EOF
-username=$USERNAME
-password=$PASS
-EOF
-        $SUDO chmod 600 "$CRED_FILE"
+        # Write via a temp file (mktemp in /tmp, mode 600) then sudo-move it.
+        # This avoids passing the password through the shell command line or
+        # through an unquoted here-doc (where $ or backticks in the password
+        # would be expanded/executed).
+        TMP_CRED=$(mktemp)
+        chmod 600 "$TMP_CRED"
+        printf 'username=%s\npassword=%s\n' "$USERNAME" "$PASS" > "$TMP_CRED"
+        $SUDO install -m 0600 -o root -g root "$TMP_CRED" "$CRED_FILE"
+        shred -u "$TMP_CRED" 2>/dev/null || rm -f "$TMP_CRED"
+        unset PASS
         pkg_update
         pkg_install cifs-utils
         OPTS="$(ask 'Mount options' 'credentials=/etc/cifs-mlperf.cred,uid=0,gid=0,vers=3.1.1,_netdev,nofail')"

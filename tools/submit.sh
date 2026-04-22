@@ -84,18 +84,19 @@ CHECKER_LOG="$OUT_DIR/compliance_checker_log.txt"
 : > "$CHECKER_LOG"
 for log in "${RESULT_LOGS[@]}"; do
     info "Checking $(basename "$log")..."
-    {
-        echo "=== $(basename "$log") ==="
-        docker run --rm --ipc=host -v "$(dirname "$log"):/logs:ro" \
-            "$IMAGE" bash -lc "
-                pip install -q 'mlperf_logging>=3.0.0' 2>/dev/null || true
-                python -m mlperf_logging.compliance_checker \
-                    --usage training --ruleset 5.1.0 \
-                    /logs/$(basename "$log")
-            " 2>&1
-        echo
-    } >> "$CHECKER_LOG"
-    if [[ "${PIPESTATUS[0]}" == "0" ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+    # Capture docker's own exit code; redirections inside a group {} do not
+    # propagate through PIPESTATUS/$? for the intended command.
+    echo "=== $(basename "$log") ===" >> "$CHECKER_LOG"
+    docker run --rm --ipc=host -v "$(dirname "$log"):/logs:ro" \
+        "$IMAGE" bash -lc "
+            pip install -q 'mlperf_logging>=3.0.0' 2>/dev/null || true
+            python -m mlperf_logging.compliance_checker \
+                --usage training --ruleset 5.1.0 \
+                /logs/$(basename "$log")
+        " >> "$CHECKER_LOG" 2>&1
+    rc=$?
+    echo >> "$CHECKER_LOG"
+    if (( rc == 0 )); then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
 done
 info "Compliance: $PASS passed, $FAIL failed (see $CHECKER_LOG)"
 (( FAIL == 0 )) || { yesno "Continue packaging despite failures?" n || die "Aborted."; }

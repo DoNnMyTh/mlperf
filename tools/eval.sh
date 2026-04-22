@@ -72,9 +72,10 @@ rc=$?
 
 say "Parsing final-status events"
 # Extract :::MLLOG lines for run_start/run_stop and eval_accuracy/eval_error
+target_rule="${TARGET:-}"
 grep -E ':::MLLOG' "$LOG" | awk -F ':::MLLOG' '{print $2}' | \
-    python - <<'PY'
-import json, sys, re
+    TARGET="$target_rule" python - <<'PY'
+import json, os, re, sys
 events = []
 for line in sys.stdin:
     try:
@@ -91,12 +92,39 @@ print(f"run_start events : {len(starts)}")
 print(f"run_stop  events : {len(stops)}  (last status = {status})")
 print(f"eval events      : {len(accs)}")
 print(f"last eval value  : {lastacc}")
-PY
 
+# Compare to workload quality target, e.g. "log_perplexity<=3.3" or "mAP>=0.34"
+rule = os.environ.get("TARGET", "").strip()
+m = re.match(r'^[A-Za-z_]+(<=|>=)([0-9.eE+\-]+)$', rule)
+if m and lastacc is not None:
+    op, thresh = m.group(1), float(m.group(2))
+    try:
+        val = float(lastacc)
+        met = (val <= thresh) if op == "<=" else (val >= thresh)
+        print(f"quality target   : {rule}  (last={val})  → {'MET' if met else 'NOT MET'}")
+        sys.exit(0 if met else 3)
+    except (TypeError, ValueError):
+        print(f"quality target   : {rule}  (last value not numeric)")
+PY
+quality_rc=$?
+
+say "RESULT"
 if (( rc == 0 )); then
-    say "RESULT: compliance check PASSED"
+    info "compliance check: PASS"
 else
-    say "RESULT: compliance check FAILED (exit $rc). See checker output above."
+    info "compliance check: FAIL (exit $rc)"
 fi
-echo "STATUS=${WL_NAME}:$([[ $rc == 0 ]] && echo PASS || echo FAIL)"
-exit $rc
+case "$quality_rc" in
+    0) info "quality target : MET" ;;
+    3) info "quality target : NOT MET" ;;
+    *) info "quality target : not evaluated (no numeric match)" ;;
+esac
+
+final=0
+(( rc == 0 )) || final=1
+# quality_rc: 0 = met, 3 = not met (fail), anything else (e.g. no rule parsed,
+# or non-numeric lastacc) is treated as "not evaluated" and does not flip
+# the overall result.
+(( quality_rc == 3 )) && final=1
+if (( final == 0 )); then echo "STATUS=${WL_NAME}:PASS"; else echo "STATUS=${WL_NAME}:FAIL"; fi
+exit "$final"

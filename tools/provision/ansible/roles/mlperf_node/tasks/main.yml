@@ -21,7 +21,6 @@
   register: bootstrap_result
   changed_when: "'Bootstrap complete.' in bootstrap_result.stdout"
   failed_when: bootstrap_result.rc != 0
-  args:
-    creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
-  # "creates" makes the task skip when the repo file already exists; full
-  # idempotency is enforced inside the bash script itself.
+  # Idempotency is enforced inside the bash script itself (every step probes
+  # current state). Do NOT use `creates:` — a single component being present
+  # would incorrectly skip the rest of the stack.

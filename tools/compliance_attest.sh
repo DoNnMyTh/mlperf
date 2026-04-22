@@ -43,6 +43,11 @@ pick(){ local p="$1"; shift; local i=1; for o in "$@"; do printf "  [%d] %s\n" "
 (( BASH_VERSINFO[0] >= 4 )) || die "Bash >= 4 required"
 [[ -t 0 ]] || die "TTY required"
 
+declare -a _TMPS=()
+cleanup_tmps(){ local f; for f in "${_TMPS[@]:-}"; do [[ -n "$f" ]] && rm -f "$f"; done; }
+trap cleanup_tmps EXIT
+trap 'err "aborted"; cleanup_tmps; exit 130' INT TERM
+
 declare -A QUALITY_TARGETS=(
     [llama31_8b]="log_perplexity<=3.3"
     [llama31_405b]="log_perplexity<=5.6"
@@ -201,7 +206,7 @@ done
 # 5. Convergence distribution
 # ------------------------------------------------------------------
 say "[5/8] Time-to-train distribution"
-tmpcat=$(mktemp)
+tmpcat=$(mktemp); _TMPS+=("$tmpcat")
 cat "${LOGS[@]}" > "$tmpcat"
 python - <<PY < "$tmpcat"
 import json, math, re, sys

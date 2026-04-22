@@ -23,7 +23,11 @@ DOCKER_GPG_URL="https://download.docker.com/linux/ubuntu/gpg"
 ENROOT_DEB_URL_TEMPLATE="https://github.com/NVIDIA/enroot/releases/download/v3.5.0/enroot_3.5.0-1_%ARCH%.deb"
 ENROOT_HOOKS_DEB_URL_TEMPLATE="https://github.com/NVIDIA/enroot/releases/download/v3.5.0/enroot+caps_3.5.0-1_%ARCH%.deb"
 PYXIS_VERSION="0.20.0"
-SLURM_VERSION="23.11.6"
+# Slurm version here is informational. The script installs the distro's
+# packaged Slurm (apt: slurm-wlm, dnf: slurm). Override by configuring an
+# upstream Slurm repo before running this script if a specific version is
+# required.
+SLURM_VERSION_NOTE="distro-packaged (see comment above)"
 
 say()  { printf "\n==> %s\n" "$*"; }
 info() { printf "    %s\n" "$*"; }
@@ -126,7 +130,12 @@ else
         pkg_update
         pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     else
-        $SUDO $PKG config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        # dnf-family: use the distro-matching Docker repo (fedora vs centos/rhel).
+        case "$OS_ID" in
+            fedora) DOCKER_REPO_URL="https://download.docker.com/linux/fedora/docker-ce.repo" ;;
+            *)      DOCKER_REPO_URL="https://download.docker.com/linux/centos/docker-ce.repo" ;;
+        esac
+        $SUDO $PKG config-manager --add-repo "$DOCKER_REPO_URL"
         pkg_install docker-ce docker-ce-cli containerd.io
     fi
 fi
@@ -140,20 +149,25 @@ say "Step 5: Enroot"
 if command -v enroot >/dev/null 2>&1; then
     info "enroot present: $(enroot version)"
 else
-    E1=${ENROOT_DEB_URL_TEMPLATE/%ARCH%/$ARCH_DEB}
-    E2=${ENROOT_HOOKS_DEB_URL_TEMPLATE/%ARCH%/$ARCH_DEB}
+    # Global replacement: "/PAT/REP" = first, "//PAT/REP" = all occurrences.
+    # The template embeds %ARCH% mid-string so we need the global form.
+    E1=${ENROOT_DEB_URL_TEMPLATE//%ARCH%/$ARCH_DEB}
+    E2=${ENROOT_HOOKS_DEB_URL_TEMPLATE//%ARCH%/$ARCH_DEB}
     TD=$(mktemp -d)
     curl -fsSL -o "$TD/enroot.deb"      "$E1"
     curl -fsSL -o "$TD/enroot-hooks.deb" "$E2"
     $SUDO dpkg -i "$TD/enroot.deb" "$TD/enroot-hooks.deb" || pkg_install -f
     rm -rf "$TD"
 fi
-$SUDO install -Dm644 /etc/enroot/enroot.conf.d/50-nvidia.conf /etc/enroot/enroot.conf.d/50-nvidia.conf 2>/dev/null || true
+# Enroot ships its own /etc/enroot/enroot.conf.d/*.conf drop-ins via the deb
+# package; no further config is required. Placeholder kept deliberately short
+# so later provisioners (e.g. fabric.sh) know enroot is expected to be
+# configured via the distro package.
 
 # ----------------------------------------------------------
 # Step 6 — Munge + Slurm
 # ----------------------------------------------------------
-say "Step 6: Munge + Slurm ${SLURM_VERSION}"
+say "Step 6: Munge + Slurm (${SLURM_VERSION_NOTE})"
 if [[ "$PKG" == "apt-get" ]]; then
     pkg_install slurm-wlm slurm-wlm-basic-plugins slurmd slurmctld munge libmunge-dev libmunge2
 else
@@ -171,7 +185,13 @@ $SUDO systemctl enable --now munge || true
 # Step 7 — Pyxis SPANK plugin
 # ----------------------------------------------------------
 say "Step 7: Pyxis v${PYXIS_VERSION}"
-if [[ ! -f /usr/lib/x86_64-linux-gnu/slurm/spank_pyxis.so && ! -f /usr/lib64/slurm/spank_pyxis.so ]]; then
+# Check every common Slurm plugin dir (deb, rpm, source-built).
+PYXIS_INSTALLED=0
+for p in /usr/lib/x86_64-linux-gnu/slurm /usr/lib64/slurm /usr/local/lib/slurm \
+         /usr/lib/slurm /opt/slurm/lib/slurm; do
+    [[ -f "$p/spank_pyxis.so" ]] && { PYXIS_INSTALLED=1; info "Pyxis found at $p"; break; }
+done
+if (( PYXIS_INSTALLED == 0 )); then
     pkg_install git
     TD=$(mktemp -d)
     git clone --depth 1 -b "v${PYXIS_VERSION}" https://github.com/NVIDIA/pyxis.git "$TD/pyxis"

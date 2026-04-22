@@ -37,6 +37,12 @@ pick(){ local p="$1"; shift; local i=1; for o in "$@"; do printf "  [%d] %s\n" "
 (( BASH_VERSINFO[0] >= 4 )) || die "Bash >= 4 required"
 [[ -t 0 ]] || die "TTY required"
 
+# Clean up any temp files we create on exit/abort.
+declare -a _TMPS=()
+cleanup_tmps(){ local f; for f in "${_TMPS[@]:-}"; do [[ -n "$f" ]] && rm -f "$f"; done; }
+trap cleanup_tmps EXIT
+trap 'err "aborted"; cleanup_tmps; exit 130' INT TERM
+
 # MLPerf training v5.1 minimum number of convergence runs per benchmark.
 # Reference: https://github.com/mlcommons/training_policies
 declare -A MIN_RUNS=(
@@ -128,7 +134,7 @@ info "  successful convergences: $SUCC   required: $MIN"
 # 4. geomean time-to-train
 # ----------------------------------------------------------------------
 say "[4/5] time-to-train (seconds, geomean over passing runs)"
-python_in=$(mktemp)
+python_in=$(mktemp); _TMPS+=("$python_in")
 for log in "${PASSED[@]}"; do
     grep -E '"key":[[:space:]]*"run_(start|stop)"' "$log"
     echo '---'

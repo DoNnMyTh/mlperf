@@ -496,15 +496,21 @@ case "$CHOICE" in
 esac
 
 if [[ -n "$IMAGE" ]]; then
-    info "Pyxis container-image format:"
-    info "  A) ${IMAGE//\//+}"
-    info "  B) docker://$IMAGE"
-    fmt=$(pick "Pyxis ref format" "${IMAGE//\//+}" "docker://$IMAGE" "skip (not using pyxis)")
-    case "$fmt" in
-        1) CONT_REF="${IMAGE//\//+}" ;;
-        2) CONT_REF="docker://$IMAGE" ;;
-        3) CONT_REF="" ;;
-    esac
+    # Only prompt for the pyxis ref format if a Slurm launcher is actually
+    # available — otherwise CONT_REF is unused and the prompt is noise.
+    if command -v sbatch >/dev/null 2>&1 || command -v srun >/dev/null 2>&1; then
+        info "Pyxis container-image format:"
+        info "  A) ${IMAGE//\//+}"
+        info "  B) docker://$IMAGE"
+        fmt=$(pick "Pyxis ref format" "${IMAGE//\//+}" "docker://$IMAGE" "skip (not using pyxis)")
+        case "$fmt" in
+            1) CONT_REF="${IMAGE//\//+}" ;;
+            2) CONT_REF="docker://$IMAGE" ;;
+            3) CONT_REF="" ;;
+        esac
+    else
+        CONT_REF=""
+    fi
 elif [[ -n "$SQSH" ]]; then
     CONT_REF="$SQSH"
 fi
@@ -550,21 +556,34 @@ if (( DO_DL == 1 )); then
         info "Please stage data manually at: $DATADIR/$WL_DATASET_SUBDIR/"
         yesno "Continue with possibly missing dataset?" n || die "Aborted."
     elif yesno "Run $WL_DOWNLOAD_SCRIPT now?" n; then
+        # Expand single layer of ${VAR} references in the manifest's env
+        # strings without invoking `eval` on arbitrary content.
+        _expand_env() {
+            local s="$1"
+            # Only expand bare ${NAME} patterns of our exported vars.
+            s="${s//\$DATADIR/$DATADIR}"
+            s="${s//\${DATADIR\}/$DATADIR}"
+            echo "$s"
+        }
         if   [[ -n "$IMAGE" ]]; then
-            eval "env_line=\"$WL_DOWNLOAD_ENV\""
+            env_line="$(_expand_env "$WL_DOWNLOAD_ENV")"
             docker run --rm --network=host \
                 -v "$DATADIR:/data" \
                 -e "$env_line" \
                 "$IMAGE" bash "$WL_DOWNLOAD_SCRIPT" || die "download failed"
         elif [[ -n "$SQSH" ]]; then
-            eval "env_line=\"$WL_DOWNLOAD_ENV\""
+            env_line="$(_expand_env "$WL_DOWNLOAD_ENV")"
             enroot start --mount "$DATADIR:/data" --env "$env_line" \
                 "$SQSH" bash "$WL_CONTAINER_WORKDIR/$WL_DOWNLOAD_SCRIPT" || die "download failed"
         else
             require_tool curl; require_tool wget
+            host_env="$(_expand_env "$WL_DOWNLOAD_HOST_ENV")"
             (
                 cd "$IMPL_DIR"
-                eval "export $WL_DOWNLOAD_HOST_ENV"
+                # Split "KEY=VALUE" on the first '='; export without eval.
+                key="${host_env%%=*}"
+                val="${host_env#*=}"
+                export "$key=$val"
                 bash "$WL_DOWNLOAD_SCRIPT"
             ) || die "download failed"
         fi
@@ -609,7 +628,11 @@ if [[ -d "$LOGDIR" ]] && [[ -n "$(ls -A "$LOGDIR" 2>/dev/null)" ]]; then
 fi
 export LOGDIR
 
-SEED="$(ask 'SEED' 42)"
+while :; do
+    SEED="$(ask 'SEED (positive integer)' 42)"
+    [[ "$SEED" =~ ^[0-9]+$ ]] && break
+    err "SEED must be a non-negative integer."
+done
 
 if (( IS_CUSTOM == 1 )); then
     for prompt in "${WL_SMOKE_PROMPTS[@]}"; do
