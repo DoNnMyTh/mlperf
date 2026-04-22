@@ -41,6 +41,7 @@ command -v docker >/dev/null 2>&1 || die "docker required"
 
 say "Pick workload"
 mapfile -t MANIFESTS < <(ls "$WORKLOADS_DIR"/*.manifest.sh 2>/dev/null)
+(( ${#MANIFESTS[@]} > 0 )) || die "No workload manifests found in $WORKLOADS_DIR"
 labels=()
 for mf in "${MANIFESTS[@]}"; do
     n="$(basename "$mf" .manifest.sh)"

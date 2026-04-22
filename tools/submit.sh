@@ -49,6 +49,7 @@ command -v jq >/dev/null 2>&1 || warn "jq missing — system_desc will not be va
 
 say "Pick workload"
 mapfile -t MANIFESTS < <(ls "$WORKLOADS_DIR"/*.manifest.sh 2>/dev/null)
+(( ${#MANIFESTS[@]} > 0 )) || die "No workload manifests found in $WORKLOADS_DIR"
 labels=()
 for mf in "${MANIFESTS[@]}"; do
     labels+=("$(basename "$mf" .manifest.sh)")
