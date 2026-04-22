@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Fake nvidia-smi for unit tests. Honours the subset of flags the repo's
+# scripts invoke. Pretends there are 4 GPUs.
+
+q=""
+f=""
+while (( $# )); do
+    case "$1" in
+        --query-gpu=*) q="${1#*=}" ;;
+        --query-gpu)   shift; q="$1" ;;
+        --format=*)    f="${1#*=}" ;;
+        --format)      shift; f="$1" ;;
+        *)             : ;;   # ignore other args for now
+    esac
+    shift
+done
+
+case "$q" in
+    index,name,memory.total)
+        cat <<EOF
+0, Fake H200, 141000 MiB
+1, Fake H200, 141000 MiB
+2, Fake H200, 141000 MiB
+3, Fake H200, 141000 MiB
+EOF
+        ;;
+    name,memory.total)
+        echo "Fake H200, 141000 MiB"
+        ;;
+    compute_cap)
+        echo "9.0"
+        ;;
+    driver_version)
+        echo "560.35.05"
+        ;;
+    *)
+        echo "Fake H200, 141000 MiB"
+        ;;
+esac
