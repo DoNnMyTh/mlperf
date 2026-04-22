@@ -1,0 +1,39 @@
+# Minimal slurm.conf for an MLPerf training cluster.
+# Copy to /etc/slurm/slurm.conf on the head node and every compute node.
+# Replace FIXME fields before starting slurmctld.
+
+ClusterName=mlperf
+ControlMachine=FIXME-head01
+SlurmUser=slurm
+SlurmdUser=root
+AuthType=auth/munge
+CryptoType=crypto/munge
+MpiDefault=pmix
+ProctrackType=proctrack/cgroup
+ReturnToService=2
+SlurmctldPidFile=/var/run/slurmctld.pid
+SlurmdPidFile=/var/run/slurmd.pid
+SlurmctldPort=6817
+SlurmdPort=6818
+SlurmdSpoolDir=/var/spool/slurmd
+StateSaveLocation=/var/spool/slurmctld
+SwitchType=switch/none
+TaskPlugin=task/cgroup,task/affinity
+
+# Scheduling
+SchedulerType=sched/backfill
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+
+# Generic resources — declare GPUs
+GresTypes=gpu
+AccountingStorageTRES=gres/gpu
+
+# GPU-aware NodeName examples (FIXME)
+NodeName=node[01-08] CPUs=128 RealMemory=1536000 Gres=gpu:h100:8 State=UNKNOWN
+
+# Partitions
+PartitionName=mlperf Nodes=ALL Default=YES MaxTime=24:00:00 State=UP
+
+# Pyxis SPANK plugin
+Include=/etc/slurm/plugstack.conf.d/*.conf
