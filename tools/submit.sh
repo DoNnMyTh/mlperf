@@ -111,7 +111,7 @@ for log in "${RESULT_LOGS[@]}"; do
     echo "=== $(basename "$log") ===" >> "$CHECKER_LOG"
     docker run --rm --ipc=host -v "$(dirname "$log"):/logs:ro" \
         "$IMAGE" bash -lc "
-            pip install -q 'mlperf_logging>=3.0.0' 2>/dev/null || true
+            pip install -q 'mlperf_logging==3.1.0' 2>/dev/null || true
             python -m mlperf_logging.compliance_checker \
                 --usage training --ruleset 5.1.0 \
                 /logs/$(basename "$log")

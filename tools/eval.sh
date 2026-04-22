@@ -84,7 +84,7 @@ say "Running mlperf_logging compliance checker"
 docker run --rm --ipc=host \
     -v "$LOGDIR:/logs:ro" \
     "$IMAGE" bash -lc "
-        pip install -q 'mlperf_logging>=3.0.0' 2>/dev/null || true
+        pip install -q 'mlperf_logging==3.1.0' 2>/dev/null || true
         python -m mlperf_logging.compliance_checker \
             --usage training --ruleset 5.1.0 \
             /logs/$LOGFILE || exit 2

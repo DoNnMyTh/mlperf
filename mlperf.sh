@@ -215,8 +215,11 @@ docker_pull_with_auth() {
     # Run docker pull separately so we can distinguish "pull failed (auth)"
     # from "pull failed (network/404/disk)". pipefail would otherwise hide
     # non-auth failures behind a failed grep.
-    docker pull "$img" >"$tmp" 2>&1
-    rc=$?
+    if declare -f retry >/dev/null 2>&1; then
+        retry docker pull "$img" >"$tmp" 2>&1; rc=$?
+    else
+        docker pull "$img" >"$tmp" 2>&1; rc=$?
+    fi
     cat "$tmp"
     if (( rc == 0 )); then
         rm -f "$tmp"
@@ -436,9 +439,9 @@ else
         yesno "$REPO_DIR exists. Reuse?" y || die "Pick a different path."
     else
         if yesno "Shallow clone (depth=1, faster)?" y; then
-            git clone --depth 1 "$REPO_URL" "$REPO_DIR" || die "clone failed"
+            { declare -f retry >/dev/null 2>&1 && retry git clone --depth 1 "$REPO_URL" "$REPO_DIR"; } || git clone --depth 1 "$REPO_URL" "$REPO_DIR" || die "clone failed"
         else
-            git clone "$REPO_URL" "$REPO_DIR" || die "clone failed"
+            { declare -f retry >/dev/null 2>&1 && retry git clone "$REPO_URL" "$REPO_DIR"; } || git clone "$REPO_URL" "$REPO_DIR" || die "clone failed"
         fi
     fi
 fi
