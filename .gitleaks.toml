@@ -1,0 +1,25 @@
+# gitleaks configuration for this repo.
+# Defaults cover AWS, GCP, GitHub, Slack, generic API keys, etc. We add
+# allowlists for patterns that legitimately appear in this repo.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-safe patterns in this repo"
+regexes = [
+    # Cosign keyless signature URL templates.
+    '''rekor.sigstore.dev''',
+    # Public Docker Hub references we embed in docs.
+    '''donnmyth/mlperf-nvidia(:[a-zA-Z0-9_.-]+)?''',
+    # MLPerf R2 downloader shell invocation (public URL).
+    '''training.mlcommons-storage.org''',
+    # GitHub raw content URLs we source by design.
+    '''raw\.githubusercontent\.com/mlcommons/r2-downloader''',
+]
+paths = [
+    # Example / template files never contain real secrets.
+    '''tools/provision/ansible/inventory\.example\.ini''',
+    '''tools/provision/ansible/group_vars/all\.example\.yml''',
+    '''tools/provision/slurm\.conf\.example''',
+]

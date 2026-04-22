@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Local-only pre-commit hook. Install with:
+#   git config core.hooksPath .git-hooks
+#
+# Runs gitleaks on staged changes and fails the commit on any detected
+# secret. Zero GitHub Actions, zero external service — runs entirely on the
+# committer's machine.
+#
+# If gitleaks is not installed, the hook prints a one-line reminder and
+# returns 0 so it does not block commits on machines without the tool. The
+# install-guard is intentional: contributors can adopt the hook per-machine,
+# and CI can install gitleaks once.
+
+set -u
+set -o pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "[pre-commit] gitleaks not installed — skipping secret scan."
+    echo "  Install: https://github.com/gitleaks/gitleaks/releases"
+    exit 0
+fi
+
+# Only scan staged changes; --no-banner keeps output tight.
+if ! gitleaks protect --staged --redact --no-banner 2>&1; then
+    echo
+    echo "[pre-commit] gitleaks detected a potential secret in staged files."
+    echo "  - If this is a false positive, add a gitleaks:allow marker or"
+    echo "    update .gitleaks.toml."
+    echo "  - Otherwise, rotate the credential and remove it from the diff."
+    exit 1
+fi
