@@ -32,7 +32,20 @@ Step 2: container source
 
 The manifest's `WL_DOCKERFILE_PATCH_TO` now expands to `89;90;100a;103a`, so a single "yes" covers both Ada and Hopper. Build time ≈ 25 min (TE + Apex wheel compile).
 
-## Gotcha #2 — no 1-node × 4-GPU config is published
+## Gotcha #2 — no 1-node × 4-GPU *canned* config is published
+
+**The driver already detects all 4 GPUs** and Step 5 (`GPUs to use (1..N)`) lets you pick 1–4. The concern is only about the topology declared inside the selected `config_*.sh`: its `TENSOR_MODEL_PARALLEL × PIPELINE_MODEL_PARALLEL × CONTEXT_PARALLEL` product (model parallelism = `mp`) must be ≤ your world size (4), otherwise NCCL init crashes with a world-size mismatch.
+
+The driver now detects this after sourcing the config and offers auto-adapt:
+
+```
+WARN: Config needs TP*PP*CP=8 GPUs, but you picked 4.
+WARN: World size < model parallelism would fail at NCCL init.
+Auto-adapt parallelism to fit 4 GPUs? (y/n) [y]: y
+    Adapted: TP=2 PP=1 CP=2 (mp=4, dp=1)
+```
+
+It halves `CP` first, then `PP`, then `TP` (always by factors of 2) until `mp ≤ NGPU`. It also resets `INTERLEAVED_PIPELINE=0` when `PP=1` and `SEQ_PARALLEL=False` when `TP=1` so the run doesn't trip those constraints.
 
 The smallest published configs are:
 
