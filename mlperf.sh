@@ -911,6 +911,16 @@ esac
 ec=$?
 if (( ec == 0 )); then
     say "Done. Outputs: $LOGDIR"
+    case "$METHOD" in
+        sbatch|sbatch_bare)
+            info "For closed-division compliance, validate with:"
+            info "  bash \"$SCRIPT_DIR/tools/compliance.sh\"  # point at $LOGDIR"
+            ;;
+        docker|bare|bare_multi|smoke|smoke_bare)
+            info "Run was NOT launched via sbatch run.sub — not MLPerf-compliant."
+            info "For a compliant run use the sbatch launcher with --container-image."
+            ;;
+    esac
 else
     err "Exit code $ec. See $LOGDIR."
 fi
