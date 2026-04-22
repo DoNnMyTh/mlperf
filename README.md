@@ -68,15 +68,17 @@ This tool collapses that workflow into a single interactive driver (`mlperf.sh`)
 - **Model weight conversion** (HF ↔ NeMo) for all LLM workloads — `tools/convert_weights.sh`.
 - **Post-training evaluation** and MLPerf log parsing — `tools/eval.sh`.
 - **Submission packaging** in MLCommons' `training_results_vX.Y/<submitter>/...` layout — `tools/submit.sh`.
-- **Cluster provisioning** (single-node bootstrap for Ubuntu 22.04/24.04 + RHEL 9: NVIDIA driver, Docker, Enroot, Slurm, Pyxis, MIG helper) — `tools/provision/bootstrap_node.sh`.
-- **Compliance certification** (mechanical checks for closed-division submissions) — `tools/compliance.sh`.
+- **Submission PR** to `mlcommons/training_results_vX.Y` via `gh` — `tools/submit_pr.sh`.
+- **Cluster provisioning** — single-node (`tools/provision/bootstrap_node.sh`) and multi-node via an Ansible role (`tools/provision/ansible/`).
+- **Fabric provisioning** — nvidia-fabricmanager, MLNX_OFED / DOCA-Host, RDMA sysctls, GPUDirect RDMA module — `tools/provision/fabric.sh`.
+- **Shared filesystem client** — NFSv4, Lustre, BeeGFS, SMB/CIFS — `tools/provision/shared_fs.sh`.
+- **Compliance certification** — mechanical checks (`tools/compliance.sh`) and reviewer-parity attestation (`tools/compliance_attest.sh`).
 
 ### Not In Scope
-- Pushing the final submission to MLCommons. `tools/submit.sh` prepares the tarball; PR submission is the operator's responsibility.
-- Multi-node cluster orchestration (Ansible/Terraform). Single-node bootstrap is covered; multi-node is documented as a wrapper around `bootstrap_node.sh`.
-- Fabric-manager / NVSwitch / InfiniBand driver tuning. Vendor-specific; follow NVIDIA OEM guides.
-- Shared filesystem deployment (Lustre, GPFS, BeeGFS).
-- Compliance **attestation**. The tool performs mechanical checks; final compliance is certified by the MLCommons submitter working group.
+- Server-side provisioning for shared filesystems. The tool mounts an existing export; it does not deploy Lustre/GPFS/BeeGFS servers.
+- Vendor-specific hardware tuning beyond what NVIDIA/Mellanox defaults produce (e.g. per-SKU thermal profiles, custom BIOS flags).
+- Compliance **attestation** by MLCommons. The tools perform reviewer-parity mechanical checks; final compliance is granted by the MLCommons submitter working group.
+- User account provisioning, PAM/AD integration, quota management.
 
 ---
 
@@ -420,7 +422,9 @@ Four single-file utilities for the lifecycle around training:
 | [`tools/convert_weights.sh`](tools/convert_weights.sh) | HF ↔ NeMo weight conversion (Llama 3.1 8B / 405B / Llama 2 70B LoRA) | ✓ (workload image) |
 | [`tools/eval.sh`](tools/eval.sh) | Parse MLLOG training logs; run `mlperf_logging.compliance_checker`; summarise convergence | ✓ |
 | [`tools/submit.sh`](tools/submit.sh) | Package a full MLCommons submission tarball (`<submitter>/{systems,benchmarks,results}`) | ✓ |
+| [`tools/submit_pr.sh`](tools/submit_pr.sh) | Fork upstream, push branch, open PR against `mlcommons/training_results_vX.Y` via `gh` | (uses `gh` CLI) |
 | [`tools/compliance.sh`](tools/compliance.sh) | Mechanical closed-division compliance gate (checker + distinct seeds + run counts + time-to-train + Slurm evidence) | ✓ |
+| [`tools/compliance_attest.sh`](tools/compliance_attest.sh) | Reviewer-parity attestation (source integrity, reproducibility, distribution, HP table, systems.json schema) | ✓ |
 
 Each tool is interactive and mirrors the driver's UI conventions (`ask`, `yesno`, `pick`). They run the container-dependent steps (compliance checker, NeMo conversion) inside the workload image so the host never needs the NeMo / mlperf_logging Python stack.
 
@@ -490,7 +494,40 @@ What it installs, in order:
 8. Kernel tuning: `vm.nr_hugepages`, TCP buffers, `memlock` / `stack` limits.
 9. `/usr/local/sbin/mlperf-mig` helper wrapping `nvidia-smi mig`.
 
-Also shipped: `tools/provision/slurm.conf.example` (GPU-aware `NodeName` / `Partition` template) and [`tools/provision/README.md`](tools/provision/README.md) with head-node vs. compute-node setup, MIG partitioning, verification commands, and explicit non-goals (fabric manager, OFED tuning, shared filesystem mount). For multi-node orchestration at scale, wrap `bootstrap_node.sh` in an Ansible role (template in the README).
+Also shipped: `tools/provision/slurm.conf.example` (GPU-aware `NodeName` / `Partition` template) and [`tools/provision/README.md`](tools/provision/README.md) with head-node vs. compute-node setup, MIG partitioning, verification commands.
+
+### 12.1 Multi-node orchestration (Ansible)
+
+[`tools/provision/ansible/`](tools/provision/ansible/) wraps `bootstrap_node.sh` in an Ansible role. Four-phase `site.yml`:
+
+1. `mlperf_node` role on every host — runs `bootstrap_node.sh`.
+2. Distribute `munge.key` from head → compute.
+3. `slurm_head` role — renders `slurm.conf` from inventory (one `NodeName` per compute host with correct `Gres=gpu:<type>:<n>`) and starts `slurmctld`.
+4. Enable + start `slurmd` on compute nodes.
+
+Inventory and variables are templated (`inventory.example.ini`, `group_vars/all.example.yml`).
+
+### 12.2 Fabric layer
+
+[`tools/provision/fabric.sh`](tools/provision/fabric.sh) handles the layer that `bootstrap_node.sh` intentionally leaves to vendor docs:
+
+- Detects NVSwitch via `lspci` and installs `nvidia-fabricmanager-<cuda>` (required for GB200 / GB300).
+- Selectable RDMA stack: MLNX_OFED, NVIDIA DOCA-Host, or distro `rdma-core`.
+- Sysctl tuning for RoCE v2 PFC and GPUDirect RDMA (`nvidia_peermem`).
+- Sanity probes (`ibstat`, `nvidia-smi topo -m`, `ib_read_bw` invocation).
+
+### 12.3 Shared filesystem
+
+[`tools/provision/shared_fs.sh`](tools/provision/shared_fs.sh) mounts one of four filesystems on a compute node against an operator-provided export:
+
+| FS | Client package(s) |
+|----|-------------------|
+| NFSv4 | `nfs-common` / `nfs-utils` |
+| Lustre | `lustre-client` + `lustre-client-dkms` (from Whamcloud repo) |
+| BeeGFS | `beegfs-client` + `beegfs-helperd` + `beegfs-utils` |
+| SMB/CIFS | `cifs-utils` |
+
+The tool writes an `/etc/fstab` entry with MLPerf-tuned options and remounts; BeeGFS is enabled via its own systemd unit.
 
 ---
 
@@ -517,10 +554,23 @@ On all-green the tool exits 0 and points the operator at `tools/submit.sh`. On a
 bash mlperf.sh   # → pick workload → sbatch run.sub → different SEED each time
 
 # When all runs complete:
-bash tools/compliance.sh       # → point at $LOGDIR
-bash tools/submit.sh           # → generate submission tarball
-# Open a PR against mlcommons/training_results_v5.1
+bash tools/compliance.sh           # → point at $LOGDIR  (mechanical gate)
+bash tools/submit.sh               # → generate submission tarball
+bash tools/compliance_attest.sh    # → reviewer-parity extended checks
+bash tools/submit_pr.sh            # → fork + branch + PR against MLCommons
 ```
+
+### 13.2 Attestation vs. Mechanical Checks
+
+`tools/compliance.sh` answers *"did this sweep pass the mechanical rules?"*. `tools/compliance_attest.sh` answers *"would an MLCommons reviewer accept this submission at first read?"*. The latter adds:
+
+- Source integrity diff against an upstream `training_results_v5.1` clone.
+- Hyperparameter table per run (optimizer, seed, GBS, LR, warmup).
+- Reproducibility — identical seeds must converge to within 1e-3.
+- Convergence distribution (mean/stddev/geomean, 2σ outlier flagging).
+- `systems/<desc>.json` validity and "no stray FIXME".
+
+Both tools are mechanical. Final compliance is certified by the MLCommons submitter working group after a reviewed PR.
 
 ---
 
