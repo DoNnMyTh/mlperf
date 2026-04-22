@@ -401,10 +401,82 @@ cat <<BANNER
 BANNER
 
 # ====================================================================
+# Auto-detect: probe the system up-front so every prompt below can offer
+# a smart default. Honours explicit env overrides.
+# ====================================================================
+autodetect_defaults() {
+    say "Step -1: auto-detecting sensible defaults"
+
+    # -------- REPO_DIR --------
+    if [[ -z "${AUTO_REPO_DIR:-}" ]]; then
+        for _cand in "${REPO_DIR:-}" "$PWD/training_results_v5.1" \
+                     "$HOME/training_results_v5.1" \
+                     "/scratch/training_results_v5.1" \
+                     "/e/training_results_v5.1-main" \
+                     "/data/training_results_v5.1"; do
+            [[ -n "$_cand" && -d "$_cand/NVIDIA/benchmarks" ]] && { AUTO_REPO_DIR="$_cand"; break; }
+        done
+        : "${AUTO_REPO_DIR:=$PWD/training_results_v5.1}"
+        info "repo      : $AUTO_REPO_DIR $([[ -d "$AUTO_REPO_DIR/.git" || -d "$AUTO_REPO_DIR/NVIDIA" ]] && echo '(existing)' || echo '(will clone)')"
+    fi
+
+    # -------- DATADIR --------
+    if [[ -z "${AUTO_DATADIR:-}" ]]; then
+        for _cand in "${DATADIR:-}" "/scratch/mlperf_data" "/mnt/mlperf_data" \
+                     "/data/mlperf_data" "$PWD/mlperf_data" "/e/mlperf_data"; do
+            [[ -n "$_cand" && -d "$_cand" ]] && { AUTO_DATADIR="$_cand"; break; }
+        done
+        : "${AUTO_DATADIR:=$PWD/mlperf_data}"
+        info "datadir   : $AUTO_DATADIR"
+    fi
+
+    # -------- LOGDIR --------
+    : "${AUTO_LOGDIR:=${LOGDIR:-$PWD/results}}"
+    info "logdir    : $AUTO_LOGDIR"
+
+    # -------- GPU arch + image variant --------
+    AUTO_GPU_ARCH="$(gpu_arch_code)"
+    case "$AUTO_GPU_ARCH" in
+        89)            AUTO_IMG_VARIANT="sm89"      ;;
+        90)            AUTO_IMG_VARIANT="build-sm90";;  # No published variant; build locally.
+        100|101|103)   AUTO_IMG_VARIANT="blackwell" ;;
+        *)             AUTO_IMG_VARIANT=""          ;;
+    esac
+    info "gpu arch  : sm_${AUTO_GPU_ARCH:-?}  suggested variant: ${AUTO_IMG_VARIANT:-build-locally}"
+
+    # -------- Existing locally-cached image --------
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        AUTO_LOCAL_IMG="$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+            | grep -E "mlperf-nvidia.*${WL_IMAGE_TAG_BASE:-}" | head -1 || true)"
+        [[ -n "$AUTO_LOCAL_IMG" ]] && info "local image present: $AUTO_LOCAL_IMG"
+    fi
+
+    # -------- Slurm account / partition --------
+    : "${AUTO_SLURM_ACCOUNT:=${SLURM_ACCOUNT:-${SBATCH_ACCOUNT:-}}}"
+    : "${AUTO_SLURM_PARTITION:=${SLURM_PARTITION:-${SBATCH_PARTITION:-}}}"
+    if [[ -z "$AUTO_SLURM_ACCOUNT" ]] && command -v sacctmgr >/dev/null 2>&1; then
+        AUTO_SLURM_ACCOUNT="$(sacctmgr -n show user "${USER:-}" format=defaultaccount 2>/dev/null | awk '{print $1}' | head -1)"
+    fi
+    [[ -n "$AUTO_SLURM_ACCOUNT" ]]   && info "slurm account   : $AUTO_SLURM_ACCOUNT"
+    [[ -n "$AUTO_SLURM_PARTITION" ]] && info "slurm partition : $AUTO_SLURM_PARTITION"
+
+    # -------- Preferred launcher --------
+    if command -v sbatch >/dev/null 2>&1; then
+        AUTO_METHOD="sbatch"
+    elif command -v docker >/dev/null 2>&1; then
+        AUTO_METHOD="docker"
+    else
+        AUTO_METHOD="bare"
+    fi
+    info "launcher  : $AUTO_METHOD (first-viable)"
+}
+
+# ====================================================================
 # step 0: preflight + workload selection
 # ====================================================================
 say "Step 0: preflight"
 require_tool git
+autodetect_defaults
 
 say "Workload selection"
 [[ -d "$WORKLOADS_DIR" ]] || die "workloads/ dir not found at $WORKLOADS_DIR"
@@ -428,12 +500,16 @@ say "Selected: $WL_DISPLAY"
 # step 1: repo
 # ====================================================================
 say "Step 1: repository"
-if yesno "Already have training_results_v5.1 cloned?" n; then
-    REPO_DIR="$(ask_req 'Absolute path to existing repo')"
+# Auto-detected default: a pre-existing checkout wins; otherwise clone to
+# $PWD/training_results_v5.1.
+_existing="n"
+[[ -d "$AUTO_REPO_DIR/NVIDIA" ]] && _existing="y"
+if yesno "Already have training_results_v5.1 cloned? (auto: $_existing)" "$_existing"; then
+    REPO_DIR="$(ask 'Path to existing repo' "$AUTO_REPO_DIR")"
     validate_path "$REPO_DIR" "repo"
     [[ -d "$REPO_DIR" ]] || die "Path not found: $REPO_DIR"
 else
-    REPO_DIR="$(ask 'Where to clone' "$PWD/training_results_v5.1")"
+    REPO_DIR="$(ask 'Where to clone' "$AUTO_REPO_DIR")"
     validate_path "$REPO_DIR" "repo"
     if [[ -e "$REPO_DIR" ]]; then
         yesno "$REPO_DIR exists. Reuse?" y || die "Pick a different path."
@@ -470,6 +546,15 @@ if (( HAS_ENROOT == 1 )); then
     OPTS+=("enroot: import from registry to .sqsh (no docker)")
     OPTS+=("enroot: use existing .sqsh file")
 fi
+# Recommend the variant that matches the detected GPU arch.
+_rec=""
+case "$AUTO_IMG_VARIANT" in
+    sm89)       _rec="pull sm89 variant for Ada (sm_89)" ;;
+    blackwell)  _rec="pull blackwell variant for sm_100/103" ;;
+    build-sm90) _rec="build locally (H100/H200 need sm_90 via Dockerfile patch)" ;;
+esac
+[[ -n "$_rec" ]] && info "Recommendation: $_rec"
+[[ -n "${AUTO_LOCAL_IMG:-}" ]] && info "(Tip: local image already cached — $AUTO_LOCAL_IMG)"
 sel=$(pick "Container source" "${OPTS[@]}")
 CHOICE="${OPTS[$((sel-1))]}"
 info "Selected: $CHOICE"
@@ -569,7 +654,7 @@ fi
 # step 3: dataset
 # ====================================================================
 say "Step 3: dataset ($WL_DATASET_SUBDIR, ~${WL_DATASET_SIZE_GB}G)"
-DATADIR="$(ask_req 'Absolute DATADIR host path')"
+DATADIR="$(ask 'DATADIR host path' "$AUTO_DATADIR")"
 validate_path "$DATADIR" "DATADIR"
 yesno "Create $DATADIR if missing?" y && mkdir -p "$DATADIR"
 export DATADIR
@@ -664,7 +749,7 @@ fi
 # step 5: runtime params
 # ====================================================================
 say "Step 5: runtime parameters"
-LOGDIR="$(ask_req 'Absolute LOGDIR')"
+LOGDIR="$(ask 'LOGDIR' "$AUTO_LOGDIR")"
 validate_path "$LOGDIR" "LOGDIR"
 yesno "Create $LOGDIR if missing?" y && mkdir -p "$LOGDIR"
 if [[ -d "$LOGDIR" ]] && [[ -n "$(ls -A "$LOGDIR" 2>/dev/null)" ]]; then
@@ -887,8 +972,8 @@ case "$METHOD" in
         exit 0
         ;;
     sbatch)
-        ACCOUNT="$(ask 'Slurm --account (blank to skip)' '')"
-        PARTITION="$(ask 'Slurm --partition (blank to skip)' '')"
+        ACCOUNT="$(ask 'Slurm --account (blank to skip)' "${AUTO_SLURM_ACCOUNT:-}")"
+        PARTITION="$(ask 'Slurm --partition (blank to skip)' "${AUTO_SLURM_PARTITION:-}")"
         RESERVATION="$(ask 'Slurm --reservation (blank to skip)' '')"
         NEXP="$(ask 'NEXP' 1)"
         ARGS=(-N "$DGXNNODES" --time="$WALLTIME")
@@ -914,8 +999,8 @@ case "$METHOD" in
         ;;
     sbatch_bare)
         bare_prereq_check
-        ACCOUNT="$(ask 'Slurm --account (blank to skip)' '')"
-        PARTITION="$(ask 'Slurm --partition (blank to skip)' '')"
+        ACCOUNT="$(ask 'Slurm --account (blank to skip)' "${AUTO_SLURM_ACCOUNT:-}")"
+        PARTITION="$(ask 'Slurm --partition (blank to skip)' "${AUTO_SLURM_PARTITION:-}")"
         WRAP="cd '$IMPL_DIR' && source config_common.sh && [[ -f config_common_cg.sh ]] && source config_common_cg.sh; [[ -f config_common_8b.sh ]] && source config_common_8b.sh; source '$CFG_FILE' && bash $WL_ENTRY"
         ARGS=(-N "$DGXNNODES" --ntasks-per-node="$DGXNGPU" --gpus-per-task=1 --time="$WALLTIME")
         [[ -n "$ACCOUNT" ]]   && ARGS+=(--account="$ACCOUNT")
