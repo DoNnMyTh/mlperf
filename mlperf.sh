@@ -704,7 +704,40 @@ else
     source "$CFG_FILE"
     set -u
     info "Config: DGXNNODES=${DGXNNODES:-?} DGXNGPU=${DGXNGPU:-?} WALLTIME=${WALLTIME:-?}"
+    info "Parallelism: TP=${TENSOR_MODEL_PARALLEL:-1} PP=${PIPELINE_MODEL_PARALLEL:-1} CP=${CONTEXT_PARALLEL:-1}"
     choose_gpus
+
+    # World size = NGPU for local docker/bare (DGXNNODES=1 override). For
+    # sbatch/srun the full cluster world size is used; we still validate
+    # against NGPU as a local-run sanity check.
+    _tp="${TENSOR_MODEL_PARALLEL:-1}"
+    _pp="${PIPELINE_MODEL_PARALLEL:-1}"
+    _cp="${CONTEXT_PARALLEL:-1}"
+    _mp=$(( _tp * _pp * _cp ))
+    if (( _mp > NGPU )) && [[ "$RUN_ON_LOGIN_NODE" != "1" ]]; then
+        warn "Config needs TP*PP*CP=$_mp GPUs, but you picked $NGPU."
+        warn "World size < model parallelism would fail at NCCL init."
+        if yesno "Auto-adapt parallelism to fit $NGPU GPUs?" y; then
+            # Reduce CP first, then PP, then TP — each must remain a power
+            # of 2 (or 1) and their product ≤ NGPU.
+            while (( _cp > 1 && _tp * _pp * _cp > NGPU )); do _cp=$(( _cp / 2 )); done
+            while (( _pp > 1 && _tp * _pp * _cp > NGPU )); do _pp=$(( _pp / 2 )); done
+            while (( _tp > 1 && _tp * _pp * _cp > NGPU )); do _tp=$(( _tp / 2 )); done
+            (( _tp * _pp * _cp <= NGPU )) \
+                || die "Could not reduce TP*PP*CP to fit $NGPU GPUs; pick a different config or edit manually."
+            export TENSOR_MODEL_PARALLEL="$_tp"
+            export PIPELINE_MODEL_PARALLEL="$_pp"
+            export CONTEXT_PARALLEL="$_cp"
+            # Interleaved pipeline only valid when PP>1.
+            (( _pp == 1 )) && export INTERLEAVED_PIPELINE=0
+            # SEQ_PARALLEL requires TP>1.
+            (( _tp == 1 )) && export SEQ_PARALLEL=False
+            info "Adapted: TP=$_tp PP=$_pp CP=$_cp (mp=$((_tp*_pp*_cp)), dp=$((NGPU/(_tp*_pp*_cp))))"
+        else
+            die "World size ($NGPU) < TP*PP*CP ($_mp); will fail at runtime."
+        fi
+    fi
+    unset _tp _pp _cp _mp
 fi
 info "Note: WALLTIME = MINUTES for docker/bare; HH:MM:SS for sbatch/srun."
 
