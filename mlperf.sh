@@ -1,34 +1,50 @@
 #!/usr/bin/env bash
-# Interactive runner for MLPerf Llama 3.1 8B NeMo benchmark (NVIDIA).
-# Supports: docker / enroot sqsh / bare-metal   x   sbatch / srun / local / multi-node / prepare-only
-# Handles login nodes, cluster + workstation + single-node cases.
+# Interactive runner for the NVIDIA MLPerf Training v5.1 submissions.
+# Workload-agnostic: reads a manifest from workloads/<name>.manifest.sh, then
+# runs a six-phase flow (repo → container → dataset → config → runtime → launch).
+#
+# Usage: bash mlperf.sh
+#
+# Supported launchers: sbatch run.sub / srun+Pyxis / docker / torchrun / bare-metal / prepare-only.
 
 set -u
 set -o pipefail
 
 # ====================================================================
-# bash version + TTY checks (edge-case #2, #3)
+# bash + TTY guards
 # ====================================================================
 if (( BASH_VERSINFO[0] < 4 )); then
     echo "ERROR: Bash >= 4 required. Current: $BASH_VERSION" >&2
-    echo "  macOS: 'brew install bash' and run with /usr/local/bin/bash or /opt/homebrew/bin/bash" >&2
+    echo "  macOS: brew install bash; run with /opt/homebrew/bin/bash" >&2
     exit 1
 fi
 if [[ ! -t 0 ]]; then
-    echo "ERROR: non-interactive stdin (piped/CI). This script requires TTY prompts." >&2
-    echo "  Run manually in a terminal." >&2
+    echo "ERROR: non-interactive stdin. Run in a terminal." >&2
     exit 1
 fi
 
 # ====================================================================
-# configuration
+# constants
 # ====================================================================
+SCRIPT_VERSION="3.0"
 REPO_URL="https://github.com/mlcommons/training_results_v5.1.git"
-REPO_SUBDIR="NVIDIA/benchmarks/llama31_8b/implementations/nemo"
-HUB_REPO="donnmyth/mlperf-nvidia"
-IMG_TAG_BASE="llama31_8b-pyt"
-SCRIPT_VERSION="2.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKLOADS_DIR="$SCRIPT_DIR/workloads"
 
+# populated from manifest
+WL_NAME=""; WL_DISPLAY=""; WL_IMPL_SUBDIR=""; WL_HUB_REPO=""; WL_IMAGE_TAG_BASE=""
+declare -a WL_IMAGE_TAG_VARIANTS=()
+WL_DATASET_SUBDIR=""; WL_DATASET_SIZE_GB=100
+declare -a WL_DATASET_MARKER_FILES=(); declare -a WL_DATASET_MARKER_DIRS=()
+WL_DOWNLOAD_SCRIPT=""; WL_DOWNLOAD_ENV=""; WL_DOWNLOAD_HOST_ENV=""
+WL_PREPROC_HOST_SUBPATH=""; WL_PREPROC_MOUNT=""
+WL_TOKENIZER_HOST_SUBPATH=""; WL_TOKENIZER_MOUNT=""
+WL_CONFIG_GLOB="config_*.sh"; WL_CONFIG_EXCLUDE_RE='^config_common|^config_mounts'
+WL_ENTRY="run_and_time.sh"; WL_PRETRAIN_PY=""; WL_CONTAINER_WORKDIR="/workspace/llm"
+WL_SMOKE_SUPPORTED=0; declare -a WL_SMOKE_ENV=(); declare -a WL_SMOKE_PROMPTS=()
+WL_DOC_URL=""; WL_DOCKERFILE_PATCH_FROM=""; WL_DOCKERFILE_PATCH_TO=""
+
+# populated during run
 IMAGE=""; SQSH=""; CONT_REF=""; CFG_FILE=""; IS_CUSTOM=0
 MAX_STEPS=3; LAYERS=2; NGPU=1
 DGXNNODES=1; DGXNGPU=1; WALLTIME="30"
@@ -36,9 +52,10 @@ NEED_DOCKER=0; NEED_ENROOT=0; NEED_BARE=0
 GPU_TOTAL=0; GPU_LIST=""; declare -a GPU_NAMES=()
 declare -a CLEANUP_CONTAINERS=()
 RUN_ON_LOGIN_NODE=0
+declare -A SMOKE_PROMPT_VALUES=()
 
 # ====================================================================
-# ui helpers
+# ui
 # ====================================================================
 say()  { printf "\n==> %s\n" "$*"; }
 info() { printf "    %s\n" "$*"; }
@@ -52,10 +69,8 @@ cleanup() {
         [[ -n "$c" ]] && docker kill "$c" >/dev/null 2>&1 || true
     done
 }
-on_abort() { err "Aborted by signal."; cleanup; exit 130; }
-on_exit()  { cleanup; }
-trap on_abort INT TERM
-trap on_exit  EXIT
+trap 'err "Aborted by signal."; cleanup; exit 130' INT TERM
+trap 'cleanup' EXIT
 
 ask()     { local p="$1" d="${2-}" v=""
             if [[ -n "$d" ]]; then read -r -p "$p [$d]: " v; echo "${v:-$d}"
@@ -81,8 +96,6 @@ pick()    { local p="$1"; shift
             done
           }
 
-# Validate user-supplied path has no space/special chars that break mounts/args.
-# (edge-case #4)
 validate_path() {
     local p="$1" label="$2"
     if [[ "$p" =~ [[:space:]] ]]; then
@@ -94,14 +107,14 @@ validate_path() {
 }
 
 # ====================================================================
-# platform detect
+# platform
 # ====================================================================
 OS="$(uname -s 2>/dev/null || echo unknown)"
 case "$OS" in
-    Linux*)              PLATFORM=linux   ;;
-    Darwin*)             PLATFORM=mac     ;;
-    MINGW*|MSYS*|CYGWIN*)PLATFORM=windows ;;
-    *)                   PLATFORM=unknown ;;
+    Linux*)               PLATFORM=linux   ;;
+    Darwin*)              PLATFORM=mac     ;;
+    MINGW*|MSYS*|CYGWIN*) PLATFORM=windows ;;
+    *)                    PLATFORM=unknown ;;
 esac
 PKG=""
 if [[ "$PLATFORM" == "linux" ]]; then
@@ -116,13 +129,13 @@ if [[ "$PLATFORM" == "windows" ]]; then
 fi
 
 # ====================================================================
-# install helpers (edge-case #26: confirm sudo escalation)
+# install helpers
 # ====================================================================
 pkg_install() {
     local p="$1"
     [[ -z "$PKG" ]] && { err "No package manager; install $p manually."; return 1; }
     if [[ -n "$SUDO" ]]; then
-        yesno "Run '$SUDO $PKG install $p' (requires admin password)?" y || return 1
+        yesno "Run '$SUDO $PKG install $p' (needs admin password)?" y || return 1
     fi
     case "$PKG" in
         apt-get) $SUDO apt-get update && $SUDO apt-get install -y "$p" ;;
@@ -139,11 +152,9 @@ guide_install() {
     case "$PLATFORM-$tool" in
         windows-git)    echo "    https://git-scm.com/download/win" ;;
         windows-docker) echo "    https://docs.docker.com/desktop/install/windows-install/" ;;
-        windows-nvidia-container-toolkit)
-                        echo "    WSL2 GPU: https://docs.nvidia.com/cuda/wsl-user-guide/" ;;
         mac-git)        echo "    xcode-select --install   or   brew install git" ;;
         mac-docker)     echo "    https://docs.docker.com/desktop/install/mac-install/" ;;
-        linux-*)        echo "    Use package manager, or vendor docs." ;;
+        linux-*)        echo "    Use your distribution's package manager." ;;
         *)              echo "    See official docs for '$tool'." ;;
     esac
 }
@@ -154,7 +165,7 @@ require_tool() {
         info "$tool: $(command -v "$tool")"
         return 0
     fi
-    err "$tool not found in PATH."
+    err "$tool not found."
     if [[ "$PLATFORM" == "linux" && -n "$PKG" ]] && yesno "Attempt install via $PKG?" y; then
         pkg_install "$tool" && command -v "$tool" >/dev/null 2>&1 && { info "$tool installed"; return 0; }
         err "Auto-install failed."
@@ -178,12 +189,11 @@ wait_for_docker() {
     info "docker daemon: $(docker info --format '{{.ServerVersion}}' 2>/dev/null)"
 }
 
-# edge-case #8: handle private registry 401
 docker_pull_with_auth() {
     local img="$1"
     if docker pull "$img" 2>&1 | tee /tmp/.pull.$$ | grep -qE "unauthorized|denied|authentication required|401"; then
         rm -f /tmp/.pull.$$
-        warn "Pull failed — looks like a private registry."
+        warn "Pull failed — private registry?"
         local host; host="$(awk -F'/' '{print $1}' <<<"$img")"
         [[ "$host" != *.* ]] && host="docker.io"
         yesno "Run 'docker login $host' now?" y || die "Cannot pull without auth."
@@ -197,15 +207,14 @@ docker_pull_with_auth() {
 enroot_import_with_auth() {
     local out="$1" ref="$2"
     local dir; dir="$(dirname "$out")"
-    # edge-case #24: writable target dir
-    [[ -w "$dir" ]] || die "No write permission on $dir for enroot sqsh output."
+    [[ -w "$dir" ]] || die "No write permission on $dir."
     if ! enroot import -o "$out" "$ref" 2>/tmp/.enroot.$$; then
         if grep -qE "401|unauthorized|credential" /tmp/.enroot.$$ 2>/dev/null; then
             rm -f /tmp/.enroot.$$
             warn "enroot import auth error."
             info "Configure creds at ~/.config/enroot/.credentials"
-            info "Format: 'machine auth.docker.io login <user> password <token>'"
-            die "Set creds and retry."
+            info "Format: machine auth.docker.io login <user> password <token>"
+            die "Set credentials and retry."
         fi
         rm -f /tmp/.enroot.$$
         die "enroot import failed"
@@ -223,7 +232,6 @@ check_nvidia() {
     fi
 }
 
-# GPU arch code (sm_XX) of first GPU; 0 if unknown.
 gpu_arch_code() {
     if command -v nvidia-smi >/dev/null 2>&1; then
         local cc; cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
@@ -232,7 +240,6 @@ gpu_arch_code() {
     echo 0
 }
 
-# edge-case #1 + #37: login-node friendly GPU detection
 detect_gpus() {
     GPU_TOTAL=0; GPU_LIST=""; GPU_NAMES=()
     if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -258,14 +265,13 @@ detect_gpus() {
     fi
 }
 
-# Ask NGPU from total. If zero (login node), accept manual input non-fatally.
 choose_gpus() {
     detect_gpus
     if (( GPU_TOTAL == 0 )); then
-        warn "No GPU visible here (login node?)."
-        if yesno "Continue anyway (will be set on allocated nodes)?" y; then
+        warn "No GPU visible (login node?)."
+        if yesno "Continue (will be set on allocated nodes)?" y; then
             RUN_ON_LOGIN_NODE=1
-            NGPU="$(ask 'GPUs per node (per config/target cluster)' "${DGXNGPU:-8}")"
+            NGPU="$(ask 'GPUs per node (target)' "${DGXNGPU:-8}")"
             return
         fi
         die "No GPUs and user declined to continue."
@@ -280,7 +286,6 @@ choose_gpus() {
     fi
 }
 
-# edge-case #7: disk space (GB) free on filesystem containing $1
 free_gb() {
     local path="$1" gb
     if [[ "$PLATFORM" == "mac" ]]; then
@@ -288,7 +293,6 @@ free_gb() {
     else
         gb=$(df -BG "$path" 2>/dev/null | awk 'NR==2 {gsub(/G$/,"",$4); print $4}')
     fi
-    # strip any remaining non-digits
     gb="${gb//[^0-9]/}"
     echo "${gb:-0}"
 }
@@ -299,47 +303,56 @@ need_space_gb() {
     info "$label: ${have}G free (need ~${need}G)"
     if (( have < need )); then
         warn "Low disk at $path (${have}G < ${need}G)."
-        yesno "Continue anyway?" n || die "Free up space and retry."
+        yesno "Continue anyway?" n || die "Free space and retry."
     fi
 }
 
-# edge-case #6: un-nest E:/.../8b/8b/ that earlier duplicate runs can produce
+# Generic: find and un-nest $root/$sub/$sub  -> $root/$sub/
 fix_nested_dataset() {
-    local root="$1"
-    if [[ -d "$root/8b/8b" && -f "$root/8b/8b/c4-train.en_6_text_document.bin" && ! -f "$root/8b/c4-train.en_6_text_document.bin" ]]; then
-        warn "Detected nested $root/8b/8b/ (from duplicate cleanup)."
-        if yesno "Un-nest by moving $root/8b/8b/* -> $root/8b/ ?" y; then
-            # Handle conflicts: remove empty/duplicate siblings at outer level.
-            ( cd "$root/8b" || exit 1
-              shopt -s dotglob nullglob
-              local f
-              for f in 8b/*; do
-                  local name; name="$(basename "$f")"
-                  if [[ -e "$name" && ! "$name" == "8b" ]]; then
-                      # outer has same name; prefer the inner copy (more recent).
-                      rm -rf "$name"
-                  fi
-                  mv -- "$f" .
-              done
-              rmdir 8b
+    local root="$1" sub="$2" marker="$3"
+    if [[ -d "$root/$sub/$sub" && -f "$root/$sub/$sub/$marker" && ! -f "$root/$sub/$marker" ]]; then
+        warn "Detected nested $root/$sub/$sub/ — un-nesting."
+        if yesno "Move $root/$sub/$sub/* -> $root/$sub/ ?" y; then
+            (
+                cd "$root/$sub" || exit 1
+                shopt -s dotglob nullglob
+                local f
+                for f in "$sub"/*; do
+                    local n; n="$(basename "$f")"
+                    [[ -e "$n" && "$n" != "$sub" ]] && rm -rf "$n"
+                    mv -- "$f" .
+                done
+                rmdir "$sub"
             ) || die "Un-nest failed."
             info "Un-nested."
         fi
     fi
 }
 
-# edge-case #5: md5 verification option (uses md5 files in dataset)
 verify_dataset_md5() {
     local dir="$1"
     command -v md5sum >/dev/null 2>&1 || { warn "md5sum missing; skipping verify."; return; }
     local f
+    shopt -s nullglob
     for f in "$dir"/*.md5; do
-        [[ -f "$f" ]] || continue
         info "Checking $(basename "$f")..."
         ( cd "$dir" && md5sum --check --quiet "$(basename "$f")" ) \
             && info "  OK" || { err "MD5 mismatch in $f"; return 1; }
     done
+    shopt -u nullglob
 }
+
+random_port() {
+    local p
+    while :; do
+        p=$(( (RANDOM % 20000) + 20000 ))
+        if ! (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then
+            echo $p; return
+        fi
+        exec 3<&- 3>&- 2>/dev/null || true
+    done
+}
+track_container() { CLEANUP_CONTAINERS+=("$1"); }
 
 # ====================================================================
 # banner
@@ -347,16 +360,34 @@ verify_dataset_md5() {
 cat <<BANNER
 
 ╔══════════════════════════════════════════════════════════════╗
-║ MLPerf Llama 3.1 8B — interactive runner    v$SCRIPT_VERSION           ║
+║ MLPerf Training v5.1 — interactive runner   v$SCRIPT_VERSION           ║
 ║ platform: $PLATFORM   pkg: ${PKG:-none}   bash: ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}
 ╚══════════════════════════════════════════════════════════════╝
 BANNER
 
 # ====================================================================
-# step 0: preflight
+# step 0: preflight + workload selection
 # ====================================================================
 say "Step 0: preflight"
 require_tool git
+
+say "Workload selection"
+[[ -d "$WORKLOADS_DIR" ]] || die "workloads/ dir not found at $WORKLOADS_DIR"
+mapfile -t MANIFESTS < <(ls "$WORKLOADS_DIR"/*.manifest.sh 2>/dev/null)
+(( ${#MANIFESTS[@]} > 0 )) || die "No workload manifests found."
+
+declare -a WL_LABELS=() WL_PATHS=()
+for mf in "${MANIFESTS[@]}"; do
+    name="$(basename "$mf" .manifest.sh)"
+    display="$(grep -E '^WL_DISPLAY=' "$mf" | head -1 | sed -E 's/^WL_DISPLAY="?([^"]*)"?/\1/')"
+    WL_LABELS+=("$name  —  ${display:-$name}")
+    WL_PATHS+=("$mf")
+done
+sel=$(pick "Choose workload" "${WL_LABELS[@]}")
+# shellcheck disable=SC1090
+source "${WL_PATHS[$((sel-1))]}"
+say "Selected: $WL_DISPLAY"
+[[ -n "$WL_DOC_URL" ]] && info "Docs: $WL_DOC_URL"
 
 # ====================================================================
 # step 1: repo
@@ -379,9 +410,9 @@ else
         fi
     fi
 fi
-NEMO_DIR="$REPO_DIR/$REPO_SUBDIR"
-[[ -f "$NEMO_DIR/Dockerfile" ]] || die "Dockerfile missing at $NEMO_DIR"
-cd "$NEMO_DIR"
+IMPL_DIR="$REPO_DIR/$WL_IMPL_SUBDIR"
+[[ -f "$IMPL_DIR/Dockerfile" ]] || die "Dockerfile missing at $IMPL_DIR"
+cd "$IMPL_DIR"
 info "CWD: $PWD"
 
 # ====================================================================
@@ -389,25 +420,20 @@ info "CWD: $PWD"
 # ====================================================================
 say "Step 2: container source"
 HAS_ENROOT=0; command -v enroot >/dev/null 2>&1 && HAS_ENROOT=1
-
-# edge-case #17: bare-metal on Windows not viable
 BARE_OK=1
-if [[ "$PLATFORM" == "windows" ]]; then
-    BARE_OK=0
-    info "Windows host: bare-metal disabled (no nvcc/TE build chain)."
-fi
+[[ "$PLATFORM" == "windows" ]] && { BARE_OK=0; info "Windows: bare-metal disabled."; }
 
 OPTS=(
     "docker: build locally (Dockerfile)"
-    "docker: pull $HUB_REPO:$IMG_TAG_BASE-blackwell   (sm_100/103 only)"
-    "docker: pull $HUB_REPO:$IMG_TAG_BASE-sm89        (adds sm_89 for 4080/4090)"
 )
-(( BARE_OK == 1 )) && OPTS+=("none — bare-metal (skip container, use host Python)")
+for variant in "${WL_IMAGE_TAG_VARIANTS[@]:-}"; do
+    [[ -n "$variant" && -n "$WL_HUB_REPO" ]] && \
+        OPTS+=("docker: pull $WL_HUB_REPO:$WL_IMAGE_TAG_BASE-$variant")
+done
+(( BARE_OK == 1 )) && OPTS+=("none — bare-metal (use host Python)")
 if (( HAS_ENROOT == 1 )); then
     OPTS+=("enroot: import from registry to .sqsh (no docker)")
     OPTS+=("enroot: use existing .sqsh file")
-else
-    info "enroot not detected — enroot options hidden."
 fi
 sel=$(pick "Container source" "${OPTS[@]}")
 CHOICE="${OPTS[$((sel-1))]}"
@@ -420,67 +446,59 @@ case "$CHOICE" in
 esac
 
 if (( NEED_DOCKER == 1 )); then
-    require_tool docker
-    wait_for_docker
-    check_nvidia
-    # edge-case #18: arch mismatch warning
+    require_tool docker; wait_for_docker; check_nvidia
     _local_arch=$(gpu_arch_code)
     if [[ "$CHOICE" == *"-blackwell"* ]] && (( _local_arch > 0 && _local_arch < 100 )); then
-        warn "Pulled image supports sm_100/103 only, but detected GPU sm_$_local_arch."
+        warn "Image supports sm_100/103 only; detected GPU sm_$_local_arch."
         yesno "Continue anyway (kernels will fail at runtime)?" n || die "Aborted."
     fi
     unset _local_arch
 fi
-if (( NEED_ENROOT == 1 )); then
-    require_tool enroot
-    check_nvidia
-fi
+(( NEED_ENROOT == 1 )) && { require_tool enroot; check_nvidia; }
 
-case "$sel" in
-    1)  IMAGE="$(ask 'Local image name:tag' "mlperf-nvidia:$IMG_TAG_BASE")"
-        if yesno "Patch Dockerfile NVTE_CUDA_ARCHS to add 89 (RTX 40xx/Ada)?" n; then
-            if grep -q 'NVTE_CUDA_ARCHS="100a;103a"' Dockerfile; then
-                sed -i 's/NVTE_CUDA_ARCHS="100a;103a"/NVTE_CUDA_ARCHS="89;100a;103a"/' Dockerfile  # edge-case #12: no .bak
-                info "Patched: $(grep NVTE_CUDA_ARCHS Dockerfile)"
-            elif grep -q 'NVTE_CUDA_ARCHS="89;100a;103a"' Dockerfile; then
+case "$CHOICE" in
+    "docker: build"*)
+        IMAGE="$(ask 'Local image name:tag' "mlperf-nvidia:$WL_IMAGE_TAG_BASE")"
+        if [[ -n "$WL_DOCKERFILE_PATCH_FROM" ]] \
+           && yesno "Patch Dockerfile ($WL_DOCKERFILE_PATCH_FROM -> $WL_DOCKERFILE_PATCH_TO)?" n; then
+            if grep -qF "$WL_DOCKERFILE_PATCH_FROM" Dockerfile; then
+                sed -i "s|$WL_DOCKERFILE_PATCH_FROM|$WL_DOCKERFILE_PATCH_TO|" Dockerfile
+                info "Patched."
+            elif grep -qF "$WL_DOCKERFILE_PATCH_TO" Dockerfile; then
                 info "Already patched."
             else
-                warn "Pattern not found; skipping patch."
+                warn "Pattern not found; skipping."
             fi
         fi
-        # edge-case #7: disk space for build
-        need_space_gb "$(dirname "$NEMO_DIR")" 80 "build dir"
+        need_space_gb "$(dirname "$IMPL_DIR")" 80 "build dir"
         yesno "Run 'docker build' now?" y || die "Cannot run without an image."
         docker build -t "$IMAGE" . || die "build failed"
         ;;
-    2)  IMAGE="$HUB_REPO:$IMG_TAG_BASE-blackwell"; docker_pull_with_auth "$IMAGE" ;;
-    3)  IMAGE="$HUB_REPO:$IMG_TAG_BASE-sm89";      docker_pull_with_auth "$IMAGE" ;;
-    *)
-        case "$CHOICE" in
-            none*)
-                : ;;  # bare-metal
-            "enroot: import"*)
-                REG="$(ask 'Registry ref' "docker://$HUB_REPO:$IMG_TAG_BASE-sm89")"
-                SQSH_OUT="$(ask 'Output .sqsh path' "$PWD/mlperf-nvidia_${IMG_TAG_BASE}.sqsh")"
-                validate_path "$SQSH_OUT" "sqsh"
-                yesno "Run: enroot import -o $SQSH_OUT $REG ?" y || die "Aborted."
-                enroot_import_with_auth "$SQSH_OUT" "$REG"
-                SQSH="$SQSH_OUT"
-                ;;
-            "enroot: use existing"*)
-                SQSH="$(ask_req 'Absolute path to existing .sqsh file')"
-                validate_path "$SQSH" "sqsh"
-                [[ -f "$SQSH" ]] || die "sqsh not found: $SQSH"
-                ;;
-            *) die "Unhandled choice: $CHOICE" ;;
-        esac ;;
+    "docker: pull"*)
+        IMAGE="$(awk '{print $NF}' <<<"$CHOICE")"
+        docker_pull_with_auth "$IMAGE"
+        ;;
+    none*)
+        : ;;
+    "enroot: import"*)
+        REG="$(ask 'Registry ref' "docker://$WL_HUB_REPO:$WL_IMAGE_TAG_BASE-${WL_IMAGE_TAG_VARIANTS[0]:-}")"
+        SQSH_OUT="$(ask 'Output .sqsh path' "$PWD/${WL_NAME}_${WL_IMAGE_TAG_BASE}.sqsh")"
+        validate_path "$SQSH_OUT" "sqsh"
+        yesno "Run: enroot import -o $SQSH_OUT $REG ?" y || die "Aborted."
+        enroot_import_with_auth "$SQSH_OUT" "$REG"
+        SQSH="$SQSH_OUT"
+        ;;
+    "enroot: use existing"*)
+        SQSH="$(ask_req 'Absolute path to existing .sqsh file')"
+        validate_path "$SQSH" "sqsh"
+        [[ -f "$SQSH" ]] || die "sqsh not found: $SQSH"
+        ;;
 esac
 
-# edge-case #14: pyxis ref format — let user pick
 if [[ -n "$IMAGE" ]]; then
     info "Pyxis container-image format:"
-    info "  A) ${IMAGE//\//+}      (hub+name:tag — classic pyxis)"
-    info "  B) docker://$IMAGE     (explicit schema, newer pyxis/enroot)"
+    info "  A) ${IMAGE//\//+}"
+    info "  B) docker://$IMAGE"
     fmt=$(pick "Pyxis ref format" "${IMAGE//\//+}" "docker://$IMAGE" "skip (not using pyxis)")
     case "$fmt" in
         1) CONT_REF="${IMAGE//\//+}" ;;
@@ -490,56 +508,71 @@ if [[ -n "$IMAGE" ]]; then
 elif [[ -n "$SQSH" ]]; then
     CONT_REF="$SQSH"
 fi
-[[ -n "$CONT_REF" ]] && info "CONT (pyxis/enroot): $CONT_REF"
-[[ -z "$IMAGE" && -z "$SQSH" ]] && info "No container — bare-metal mode."
+[[ -n "$CONT_REF" ]] && info "CONT: $CONT_REF"
 
 # ====================================================================
 # step 3: dataset
 # ====================================================================
-say "Step 3: dataset"
-DATADIR="$(ask_req 'Absolute DATADIR (will contain 8b/)')"
+say "Step 3: dataset ($WL_DATASET_SUBDIR, ~${WL_DATASET_SIZE_GB}G)"
+DATADIR="$(ask_req 'Absolute DATADIR host path')"
 validate_path "$DATADIR" "DATADIR"
 yesno "Create $DATADIR if missing?" y && mkdir -p "$DATADIR"
 export DATADIR
 
-fix_nested_dataset "$DATADIR"  # edge-case #6
+# un-nest if the first marker file indicates duplicate-cleanup nesting
+if (( ${#WL_DATASET_MARKER_FILES[@]} > 0 )); then
+    fix_nested_dataset "$DATADIR" "$WL_DATASET_SUBDIR" "${WL_DATASET_MARKER_FILES[0]}"
+fi
 
 dataset_files_ok() {
-    [[ -f "$DATADIR/8b/c4-train.en_6_text_document.bin" \
-    && -f "$DATADIR/8b/c4-train.en_6_text_document.idx" \
-    && -d "$DATADIR/8b/tokenizer" ]]
+    local f d
+    for f in "${WL_DATASET_MARKER_FILES[@]:-}"; do
+        [[ -f "$DATADIR/$WL_DATASET_SUBDIR/$f" ]] || return 1
+    done
+    for d in "${WL_DATASET_MARKER_DIRS[@]:-}"; do
+        [[ -d "$DATADIR/$WL_DATASET_SUBDIR/$d" ]] || return 1
+    done
+    return 0
 }
 
 DO_DL=1
 if dataset_files_ok; then
-    if yesno "Dataset present at $DATADIR/8b. Skip download?" y; then
+    if yesno "Dataset present at $DATADIR/$WL_DATASET_SUBDIR. Skip download?" y; then
         DO_DL=0
-        # edge-case #5: offer md5 verify
-        yesno "Verify md5 checksums now?" n && verify_dataset_md5 "$DATADIR/8b"
+        yesno "Verify md5 checksums?" n && verify_dataset_md5 "$DATADIR/$WL_DATASET_SUBDIR"
     fi
 fi
 
 if (( DO_DL == 1 )); then
-    need_space_gb "$DATADIR" 100 "DATADIR"
-    if yesno "Download dataset now? (~80 GB, hours-long)" n; then
+    need_space_gb "$DATADIR" "$WL_DATASET_SIZE_GB" "DATADIR"
+    if [[ -z "$WL_DOWNLOAD_SCRIPT" ]]; then
+        warn "This workload has no automated download script."
+        info "Please stage data manually at: $DATADIR/$WL_DATASET_SUBDIR/"
+        yesno "Continue with possibly missing dataset?" n || die "Aborted."
+    elif yesno "Run $WL_DOWNLOAD_SCRIPT now?" n; then
         if   [[ -n "$IMAGE" ]]; then
+            eval "env_line=\"$WL_DOWNLOAD_ENV\""
             docker run --rm --network=host \
-                -v "$DATADIR:/data" -e DATADIR=/data/8b \
-                "$IMAGE" bash data_scripts/download_8b.sh || die "download failed"
+                -v "$DATADIR:/data" \
+                -e "$env_line" \
+                "$IMAGE" bash "$WL_DOWNLOAD_SCRIPT" || die "download failed"
         elif [[ -n "$SQSH" ]]; then
-            enroot start --mount "$DATADIR:/data" --env "DATADIR=/data/8b" \
-                "$SQSH" bash /workspace/llm/data_scripts/download_8b.sh || die "download failed"
+            eval "env_line=\"$WL_DOWNLOAD_ENV\""
+            enroot start --mount "$DATADIR:/data" --env "$env_line" \
+                "$SQSH" bash "$WL_CONTAINER_WORKDIR/$WL_DOWNLOAD_SCRIPT" || die "download failed"
         else
-            require_tool curl
-            require_tool wget
-            ( cd "$NEMO_DIR" && DATADIR="$DATADIR/8b" bash data_scripts/download_8b.sh ) \
-                || die "download failed"
+            require_tool curl; require_tool wget
+            (
+                cd "$IMPL_DIR"
+                eval "export $WL_DOWNLOAD_HOST_ENV"
+                bash "$WL_DOWNLOAD_SCRIPT"
+            ) || die "download failed"
         fi
-        fix_nested_dataset "$DATADIR"
+        (( ${#WL_DATASET_MARKER_FILES[@]} > 0 )) && \
+            fix_nested_dataset "$DATADIR" "$WL_DATASET_SUBDIR" "${WL_DATASET_MARKER_FILES[0]}"
     else
-        warn "Skipped. Expected layout:"
-        info "  $DATADIR/8b/{c4-*.bin,c4-*.idx,tokenizer/,LICENSE.txt,NOTICE.txt}"
-        yesno "Continue with missing dataset?" n || die "Aborted."
+        warn "Skipped download."
+        yesno "Continue without dataset?" n || die "Aborted."
     fi
 fi
 
@@ -547,15 +580,14 @@ fi
 # step 4: config
 # ====================================================================
 say "Step 4: config"
-mapfile -t CONFIGS < <(ls config_*.sh 2>/dev/null | grep -Ev '^config_common' || true)
-(( ${#CONFIGS[@]} > 0 )) || die "No config_*.sh found in $PWD"
+mapfile -t CONFIGS < <(ls $WL_CONFIG_GLOB 2>/dev/null | grep -Ev "$WL_CONFIG_EXCLUDE_RE" || true)
+(( ${#CONFIGS[@]} > 0 )) || die "No config files matching '$WL_CONFIG_GLOB' in $PWD"
 
 labels=("${CONFIGS[@]}")
-labels+=("custom single-GPU smoke (TP=PP=CP=1, 2 layers, few steps; NOT compliant)")
+(( WL_SMOKE_SUPPORTED == 1 )) && labels+=("custom single-GPU smoke (NOT compliant)")
 sel=$(pick "Pick a config" "${labels[@]}")
-if (( sel == ${#labels[@]} )); then
-    IS_CUSTOM=1
-    CFG_FILE=""
+if (( WL_SMOKE_SUPPORTED == 1 )) && (( sel == ${#labels[@]} )); then
+    IS_CUSTOM=1; CFG_FILE=""
 else
     CFG_FILE="${CONFIGS[$((sel-1))]}"
 fi
@@ -564,17 +596,15 @@ fi
 # step 5: runtime params
 # ====================================================================
 say "Step 5: runtime parameters"
-LOGDIR="$(ask_req 'Absolute LOGDIR (outputs)')"
+LOGDIR="$(ask_req 'Absolute LOGDIR')"
 validate_path "$LOGDIR" "LOGDIR"
 yesno "Create $LOGDIR if missing?" y && mkdir -p "$LOGDIR"
-
-# edge-case #10: LOGDIR non-empty
 if [[ -d "$LOGDIR" ]] && [[ -n "$(ls -A "$LOGDIR" 2>/dev/null)" ]]; then
-    warn "LOGDIR $LOGDIR not empty."
-    if yesno "Use timestamped sub-dir to avoid clobber?" y; then
+    warn "LOGDIR not empty."
+    if yesno "Use timestamped sub-dir?" y; then
         LOGDIR="$LOGDIR/$(date +%Y%m%d_%H%M%S)"
         mkdir -p "$LOGDIR"
-        info "New LOGDIR: $LOGDIR"
+        info "LOGDIR: $LOGDIR"
     fi
 fi
 export LOGDIR
@@ -582,18 +612,19 @@ export LOGDIR
 SEED="$(ask 'SEED' 42)"
 
 if (( IS_CUSTOM == 1 )); then
-    MAX_STEPS="$(ask 'MAX_STEPS' 3)"
-    LAYERS="$(ask 'OVERWRITTEN_NUM_LAYERS' 2)"
+    for prompt in "${WL_SMOKE_PROMPTS[@]}"; do
+        key="${prompt%%:*}"; default="${prompt#*:}"
+        val="$(ask "$key" "$default")"
+        SMOKE_PROMPT_VALUES["$key"]="$val"
+    done
     choose_gpus
     if (( NGPU > 1 )); then
-        warn "Custom smoke is 1-GPU only; overriding NGPU=1"
+        warn "Custom smoke is 1-GPU only; NGPU=1"
         NGPU=1
-        # edge-case #11: guard unset var
         export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
         export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
     fi
 else
-    # edge-case #9: set +u around config source (MLPerf configs ref many optional vars)
     set +u
     # shellcheck disable=SC1090
     source "$CFG_FILE"
@@ -601,132 +632,96 @@ else
     info "Config: DGXNNODES=${DGXNNODES:-?} DGXNGPU=${DGXNGPU:-?} WALLTIME=${WALLTIME:-?}"
     choose_gpus
 fi
-
-# edge-case #25: explain WALLTIME units
-info "Note: WALLTIME uses MINUTES for docker/bare paths; HH:MM:SS for sbatch/srun."
+info "Note: WALLTIME = MINUTES for docker/bare; HH:MM:SS for sbatch/srun."
 
 # ====================================================================
-# step 6: launcher selection
+# step 6: launcher
 # ====================================================================
 say "Step 6: launch method"
 HAS_SBATCH=0; command -v sbatch >/dev/null 2>&1 && HAS_SBATCH=1
 HAS_SRUN=0;   command -v srun   >/dev/null 2>&1 && HAS_SRUN=1
-info "Detected: sbatch=$HAS_SBATCH srun=$HAS_SRUN enroot=$HAS_ENROOT docker=$NEED_DOCKER is_custom=$IS_CUSTOM bare_ok=$BARE_OK login_node=$RUN_ON_LOGIN_NODE"
+info "Detected: sbatch=$HAS_SBATCH srun=$HAS_SRUN enroot=$HAS_ENROOT docker=$NEED_DOCKER bare_ok=$BARE_OK login=$RUN_ON_LOGIN_NODE"
 
 OPTS=(); KEYS=()
 add_opt(){ OPTS+=("$1"); KEYS+=("$2"); }
 
 if (( HAS_SBATCH == 1 && IS_CUSTOM == 0 )) && [[ -n "$CONT_REF" ]]; then
-    add_opt "sbatch run.sub  (MLPerf native, Slurm+Pyxis+Enroot, containerized)" "sbatch"
+    add_opt "sbatch run.sub (Slurm+Pyxis+Enroot, containerized)" "sbatch"
 fi
 if (( HAS_SRUN == 1 && HAS_ENROOT == 1 && IS_CUSTOM == 0 )) && [[ -n "$CONT_REF" ]]; then
-    add_opt "srun + Pyxis/Enroot (interactive, containerized)" "srun"
+    add_opt "srun + Pyxis/Enroot (interactive)" "srun"
 fi
 if (( HAS_SBATCH == 1 && IS_CUSTOM == 0 && BARE_OK == 1 )); then
-    add_opt "sbatch bare-metal (Slurm, no container, host Python deps)" "sbatch_bare"
+    add_opt "sbatch bare-metal (Slurm, no container)" "sbatch_bare"
 fi
 if (( HAS_SRUN == 1 && IS_CUSTOM == 0 && BARE_OK == 1 )); then
-    add_opt "srun bare-metal (interactive Slurm, no container)" "srun_bare"
+    add_opt "srun bare-metal (Slurm, no container)" "srun_bare"
 fi
 if (( RUN_ON_LOGIN_NODE == 0 )); then
-    [[ -n "$IMAGE" ]] && add_opt "docker run (single-node; NOT MLPerf-compliant)" "docker"
-    (( BARE_OK == 1 )) && add_opt "bare-metal torchrun (single-node, host Python)" "bare"
+    [[ -n "$IMAGE" ]] && add_opt "docker run (single-node)" "docker"
+    (( BARE_OK == 1 )) && add_opt "bare-metal torchrun (single-node)" "bare"
     if (( IS_CUSTOM == 0 && BARE_OK == 1 )); then
-        add_opt "bare-metal torchrun multi-node (no Slurm; run on each node)" "bare_multi"
+        add_opt "bare-metal torchrun multi-node (no Slurm)" "bare_multi"
     fi
 fi
-
 if (( IS_CUSTOM == 1 )); then
     OPTS=(); KEYS=()
-    [[ -n "$IMAGE" && $RUN_ON_LOGIN_NODE -eq 0 ]] && add_opt "docker smoke (single-GPU)" "smoke"
-    (( BARE_OK == 1 && RUN_ON_LOGIN_NODE == 0 )) && add_opt "bare-metal smoke (single-GPU)" "smoke_bare"
+    [[ -n "$IMAGE" && $RUN_ON_LOGIN_NODE -eq 0 ]] && add_opt "docker smoke" "smoke"
+    (( BARE_OK == 1 && RUN_ON_LOGIN_NODE == 0 )) && add_opt "bare-metal smoke" "smoke_bare"
 fi
+add_opt "prepare-only (stop here; print commands)" "prepare"
 
-add_opt "prepare-only (stop here; print next command)" "prepare"
-
-(( ${#OPTS[@]} > 0 )) || die "No launch method available for your selections."
+(( ${#OPTS[@]} > 0 )) || die "No launch method available."
 sel=$(pick "Choose launcher" "${OPTS[@]}")
 METHOD="${KEYS[$((sel-1))]}"
 yesno "Proceed with '$METHOD'?" y || die "Aborted."
 
-# ====================================================================
-# dispatch helpers
-# ====================================================================
-# edge-case #23: pick a free MASTER_PORT
-random_port() {
-    local p
-    while :; do
-        p=$(( (RANDOM % 20000) + 20000 ))
-        if ! (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then
-            echo $p; return
-        fi
-        exec 3<&- 3>&- 2>/dev/null || true
-    done
-}
 DEFAULT_MPORT=$(random_port)
 
 docker_common_args=(
     --rm --gpus all --ipc=host --shm-size=16g --network=host
     --ulimit memlock=-1 --ulimit stack=67108864
-    -v "$DATADIR/8b:/preproc_data:ro"
-    -v "$DATADIR/8b/tokenizer:/workspace/llm/nemo_tokenizer:ro"
+    -v "$DATADIR/$WL_PREPROC_HOST_SUBPATH:$WL_PREPROC_MOUNT:ro"
     -v "$LOGDIR:/results"
     -e SEED="$SEED" -e WALLTIME="$WALLTIME"
     -e RANK=0 -e LOCAL_RANK=0 -e WORLD_SIZE=1 -e LOCAL_WORLD_SIZE=1
     -e MASTER_ADDR=127.0.0.1 -e MASTER_PORT="$DEFAULT_MPORT"
     -e SLURM_JOB_ID=local -e SLURM_PROCID=0 -e SLURM_LOCALID=0
 )
-# Propagate CUDA_VISIBLE_DEVICES if user picked a subset (edge-case #41)
+if [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]]; then
+    docker_common_args+=(-v "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH:$WL_TOKENIZER_MOUNT:ro")
+fi
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     docker_common_args+=(-e CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
 fi
 
-smoke_env=(
-    DGXNGPU=1 DGXNNODES=1
-    TENSOR_MODEL_PARALLEL=1 PIPELINE_MODEL_PARALLEL=1 CONTEXT_PARALLEL=1
-    SEQ_PARALLEL=False INTERLEAVED_PIPELINE=0
-    MICRO_BATCH_SIZE=1 MINIBS=1
-    OVERWRITTEN_NUM_LAYERS="$LAYERS"
-    FP8=False FP8_HYBRID=False FP8_PARAM_GATHER=False
-    TP_COMM_OVERLAP=False MC_TP_OVERLAP_AG=False MC_TP_OVERLAP_RS=False
-    OVERLAP_PARAM_GATHER=False OVERLAP_GRAD_REDUCE=False USE_DIST_OPTIMIZER=False
-    MAX_STEPS="$MAX_STEPS" VAL_CHECK_INTERVAL=999 WARMUP_STEPS=0 LOAD_CHECKPOINT=""
-    BINDCMD=""
-)
-smoke_env_str() { local s=; local kv; for kv in "${smoke_env[@]}"; do s+=" $kv"; done; echo "$s"; }
+build_smoke_env_str() {
+    local s=""
+    local kv
+    for kv in "${WL_SMOKE_ENV[@]}"; do s+=" $kv"; done
+    local k
+    for k in "${!SMOKE_PROMPT_VALUES[@]}"; do s+=" $k=${SMOKE_PROMPT_VALUES[$k]}"; done
+    echo "$s"
+}
 
-# edge-case #16: bare-metal pip install only inside venv/conda
 bare_prereq_check() {
     say "Bare-metal prerequisite check"
-    require_tool python
-    require_tool torchrun
+    require_tool python; require_tool torchrun
     info "python: $(python --version 2>&1)"
     python -c "import torch; print('torch=%s cuda=%s' % (torch.__version__, torch.cuda.is_available()))" \
         || die "torch import failed"
-    local miss=()
-    for m in nemo megatron transformer_engine hydra mlperf_common pytorch_lightning apex; do
-        python -c "import $m" >/dev/null 2>&1 || miss+=("$m")
-    done
-    if (( ${#miss[@]} > 0 )); then
-        err "Missing Python modules: ${miss[*]}"
-        info "Minimal: pip install -r $NEMO_DIR/requirements.txt"
-        info "Full: NeMo, Megatron-LM, TransformerEngine, apex — build from source (see Dockerfile)."
-        if yesno "Run 'pip install -r requirements.txt'?" n; then
+    if [[ -f "$IMPL_DIR/requirements.txt" ]]; then
+        if yesno "pip install -r $IMPL_DIR/requirements.txt?" n; then
             if [[ -z "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]]; then
-                err "No venv/conda detected. Refusing to pip install into system site-packages."
-                info "Create one: python -m venv ~/.venv/mlperf && source ~/.venv/mlperf/bin/activate"
-                die "Activate an env and retry."
+                die "No venv/conda active; refusing to pollute system site-packages."
             fi
-            pip install -r "$NEMO_DIR/requirements.txt" || warn "pip install had issues"
+            pip install -r "$IMPL_DIR/requirements.txt" || warn "pip install issues"
         fi
-        yesno "Continue despite missing modules?" n || die "Aborted."
     fi
 }
 
-# edge-case #13: only called by local bare; srun_bare relies on srun-injected env
 bare_env_export() {
     export DATADIR LOGDIR SEED
-    export PREPROC_DATA_DIR="$DATADIR/8b"
     : "${RANK:=0}"; : "${LOCAL_RANK:=0}"
     : "${WORLD_SIZE:=1}"; : "${LOCAL_WORLD_SIZE:=1}"
     : "${MASTER_ADDR:=127.0.0.1}"; : "${MASTER_PORT:=$DEFAULT_MPORT}"
@@ -736,55 +731,49 @@ bare_env_export() {
            SLURM_JOB_ID SLURM_PROCID SLURM_LOCALID BINDCMD
 }
 
-track_container() { CLEANUP_CONTAINERS+=("$1"); }
-
 emit_prepare_summary() {
     cat <<EOF
 
 ========= PREPARE-ONLY SUMMARY =========
+workload     : $WL_NAME  —  $WL_DISPLAY
 repo         : $REPO_DIR
-nemo dir     : $NEMO_DIR
+impl dir     : $IMPL_DIR
 image        : ${IMAGE:-<none>}
 sqsh         : ${SQSH:-<none>}
 cont ref     : ${CONT_REF:-<none>}
-datadir      : $DATADIR/8b
+datadir      : $DATADIR/$WL_DATASET_SUBDIR
 logdir       : $LOGDIR
 config       : ${CFG_FILE:-<custom smoke>}
-GPUs         : ${NGPU:-?} / ${GPU_TOTAL:-?}  (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<all>})
+GPUs         : ${NGPU:-?} / ${GPU_TOTAL:-?}  (CVD=${CUDA_VISIBLE_DEVICES:-<all>})
 nnodes       : ${DGXNNODES:-1}   gpus/node : ${DGXNGPU:-$NGPU}
-seed         : $SEED
-walltime     : ${WALLTIME:-?}
+seed         : $SEED   walltime: ${WALLTIME:-?}
 =========================================
 
 To launch later:
 
-# Slurm (containerized, MLPerf-native):
+# Slurm containerized (MLPerf-native):
 CONT="$CONT_REF" DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" \\
-  sbatch -N ${DGXNNODES:-1} --time=${WALLTIME:-00:30:00} "$NEMO_DIR/run.sub"
+  sbatch -N ${DGXNNODES:-1} --time=${WALLTIME:-00:30:00} "$IMPL_DIR/run.sub"
 
 # Single-node docker:
 docker run --rm --gpus all --ipc=host --shm-size=16g \\
-  -v "$DATADIR/8b:/preproc_data:ro" \\
-  -v "$DATADIR/8b/tokenizer:/workspace/llm/nemo_tokenizer:ro" \\
+  -v "$DATADIR/$WL_PREPROC_HOST_SUBPATH:$WL_PREPROC_MOUNT:ro" \\
   -v "$LOGDIR:/results" \\
   ${IMAGE:-<image>} bash -c \\
-    "cd /workspace/llm && source config_common.sh && source config_common_cg.sh && \\
-     source config_common_8b.sh && source ${CFG_FILE:-<cfg>} && bash run_and_time.sh"
-
-# Bare-metal single-node:
-cd "$NEMO_DIR" && \\
-  source config_common.sh && source config_common_cg.sh && source config_common_8b.sh && \\
-  source "${CFG_FILE:-<cfg>}" && \\
-  RANK=0 LOCAL_RANK=0 WORLD_SIZE=1 LOCAL_WORLD_SIZE=1 \\
-  MASTER_ADDR=127.0.0.1 MASTER_PORT=$DEFAULT_MPORT SEED=$SEED WALLTIME=${WALLTIME:-30} \\
-  SLURM_JOB_ID=local SLURM_PROCID=0 SLURM_LOCALID=0 BINDCMD='' \\
-  bash run_and_time.sh
+    "cd $WL_CONTAINER_WORKDIR && source config_common.sh && source ${CFG_FILE:-<cfg>} && bash $WL_ENTRY"
 EOF
 }
 
-# ====================================================================
-# dispatch
-# ====================================================================
+# Re-source common configs and the picked config inside subshell to be safe.
+source_configs() {
+    set +u
+    for f in config_common.sh config_common_cg.sh config_common_8b.sh; do
+        [[ -f "$f" ]] && source "$f"
+    done
+    [[ -n "$CFG_FILE" && -f "$CFG_FILE" ]] && source "$CFG_FILE"
+    set -u
+}
+
 case "$METHOD" in
     prepare)
         emit_prepare_summary
@@ -794,33 +783,33 @@ case "$METHOD" in
         ACCOUNT="$(ask 'Slurm --account (blank to skip)' '')"
         PARTITION="$(ask 'Slurm --partition (blank to skip)' '')"
         RESERVATION="$(ask 'Slurm --reservation (blank to skip)' '')"
-        NEXP="$(ask 'NEXP (repetitions per job)' 1)"
+        NEXP="$(ask 'NEXP' 1)"
         ARGS=(-N "$DGXNNODES" --time="$WALLTIME")
         [[ -n "$ACCOUNT" ]]     && ARGS+=(--account="$ACCOUNT")
         [[ -n "$PARTITION" ]]   && ARGS+=(--partition="$PARTITION")
         [[ -n "$RESERVATION" ]] && ARGS+=(--reservation="$RESERVATION")
-        say "sbatch ${ARGS[*]} run.sub  CONT=$CONT_REF"
         CONT="$CONT_REF" DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" NEXP="$NEXP" \
             sbatch "${ARGS[@]}" run.sub
         ;;
     srun)
         NODES="$(ask 'Nodes (-N)' "$DGXNNODES")"
-        NTPN="$(ask 'ntasks-per-node (= GPUs/node)' "$DGXNGPU")"
+        NTPN="$(ask 'ntasks-per-node' "$DGXNGPU")"
         GPUS="$(ask 'gpus-per-task' 1)"
-        TIME="$(ask 'time limit (HH:MM:SS)' "$WALLTIME")"
-        say "srun + pyxis/enroot. CONT=$CONT_REF"
+        TIME="$(ask 'time limit' "$WALLTIME")"
+        mounts="$DATADIR/$WL_PREPROC_HOST_SUBPATH:$WL_PREPROC_MOUNT:ro,$LOGDIR:/results"
+        [[ -n "$WL_TOKENIZER_HOST_SUBPATH" ]] && \
+            mounts="$mounts,$DATADIR/$WL_TOKENIZER_HOST_SUBPATH:$WL_TOKENIZER_MOUNT:ro"
         CONT="$CONT_REF" DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" \
             srun -N "$NODES" --ntasks-per-node="$NTPN" --gpus-per-task="$GPUS" --time="$TIME" \
-                 --container-image="$CONT_REF" \
-                 --container-mounts="$DATADIR/8b:/preproc_data:ro,$DATADIR/8b/tokenizer:/workspace/llm/nemo_tokenizer:ro,$LOGDIR:/results" \
-                 --container-workdir=/workspace/llm \
-                 bash run_and_time.sh
+                 --container-image="$CONT_REF" --container-mounts="$mounts" \
+                 --container-workdir="$WL_CONTAINER_WORKDIR" \
+                 bash "$WL_ENTRY"
         ;;
     sbatch_bare)
         bare_prereq_check
         ACCOUNT="$(ask 'Slurm --account (blank to skip)' '')"
         PARTITION="$(ask 'Slurm --partition (blank to skip)' '')"
-        WRAP="cd '$NEMO_DIR' && source config_common.sh && source config_common_cg.sh && source config_common_8b.sh && source '$CFG_FILE' && bash run_and_time.sh"
+        WRAP="cd '$IMPL_DIR' && source config_common.sh && [[ -f config_common_cg.sh ]] && source config_common_cg.sh; [[ -f config_common_8b.sh ]] && source config_common_8b.sh; source '$CFG_FILE' && bash $WL_ENTRY"
         ARGS=(-N "$DGXNNODES" --ntasks-per-node="$DGXNGPU" --gpus-per-task=1 --time="$WALLTIME")
         [[ -n "$ACCOUNT" ]]   && ARGS+=(--account="$ACCOUNT")
         [[ -n "$PARTITION" ]] && ARGS+=(--partition="$PARTITION")
@@ -832,81 +821,88 @@ case "$METHOD" in
         NODES="$(ask 'Nodes (-N)' "$DGXNNODES")"
         NTPN="$(ask 'ntasks-per-node' "$DGXNGPU")"
         GPUS="$(ask 'gpus-per-task' 1)"
-        TIME="$(ask 'time limit (HH:MM:SS)' "$WALLTIME")"
+        TIME="$(ask 'time limit' "$WALLTIME")"
         DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" \
             srun -N "$NODES" --ntasks-per-node="$NTPN" --gpus-per-task="$GPUS" --time="$TIME" \
-                 --chdir="$NEMO_DIR" \
-                 bash -c "source config_common.sh && source config_common_cg.sh && source config_common_8b.sh && source '$CFG_FILE' && bash run_and_time.sh"
+                 --chdir="$IMPL_DIR" \
+                 bash -c "source config_common.sh && source '$CFG_FILE' && bash $WL_ENTRY"
         ;;
     docker)
-        CNAME="mlperf-llama31-$$-$(date +%s)"
+        CNAME="mlperf-$WL_NAME-$$-$(date +%s)"
         track_container "$CNAME"
         docker run --name "$CNAME" "${docker_common_args[@]}" \
             "$IMAGE" bash -c "
-                cd /workspace/llm &&
-                source config_common.sh && source config_common_cg.sh && source config_common_8b.sh &&
-                source /workspace/llm/$CFG_FILE &&
+                cd $WL_CONTAINER_WORKDIR &&
+                [ -f config_common.sh ] && source config_common.sh
+                [ -f config_common_cg.sh ] && source config_common_cg.sh
+                [ -f config_common_8b.sh ] && source config_common_8b.sh
+                source $CFG_FILE &&
                 export DGXNGPU=$NGPU DGXNNODES=1 BINDCMD='' &&
-                bash run_and_time.sh
+                bash $WL_ENTRY
             "
         ;;
     bare)
         bare_prereq_check
         bare_env_export
-        ln -sfn "$DATADIR/8b/tokenizer" "$NEMO_DIR/nemo_tokenizer"
+        [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
+            ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         (
-            cd "$NEMO_DIR"
-            set +u; source config_common.sh && source config_common_cg.sh && source config_common_8b.sh; set -u
-            set +u; source "$CFG_FILE"; set -u
+            cd "$IMPL_DIR"
+            source_configs
             export DGXNGPU="$NGPU" DGXNNODES=1 BINDCMD=""
-            bash run_and_time.sh
+            bash "$WL_ENTRY"
         )
         ;;
     smoke)
-        CNAME="mlperf-smoke-$$-$(date +%s)"
+        CNAME="mlperf-$WL_NAME-smoke-$$-$(date +%s)"
         track_container "$CNAME"
+        SMOKE_STR="$(build_smoke_env_str)"
         docker run --name "$CNAME" "${docker_common_args[@]}" \
             -e SLURM_JOB_ID=smoke \
             "$IMAGE" bash -c "
-                cd /workspace/llm &&
-                source config_common.sh && source config_common_cg.sh && source config_common_8b.sh &&
-                export $(smoke_env_str) &&
-                bash run_and_time.sh
+                cd $WL_CONTAINER_WORKDIR &&
+                [ -f config_common.sh ] && source config_common.sh
+                [ -f config_common_cg.sh ] && source config_common_cg.sh
+                [ -f config_common_8b.sh ] && source config_common_8b.sh
+                export $SMOKE_STR &&
+                bash $WL_ENTRY
             "
         ;;
     smoke_bare)
         bare_prereq_check
         bare_env_export
-        ln -sfn "$DATADIR/8b/tokenizer" "$NEMO_DIR/nemo_tokenizer"
+        [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
+            ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         (
-            cd "$NEMO_DIR"
-            set +u; source config_common.sh && source config_common_cg.sh && source config_common_8b.sh; set -u
-            export "${smoke_env[@]}"
-            bash run_and_time.sh
+            cd "$IMPL_DIR"
+            source_configs
+            export "${WL_SMOKE_ENV[@]}"
+            for k in "${!SMOKE_PROMPT_VALUES[@]}"; do export "$k=${SMOKE_PROMPT_VALUES[$k]}"; done
+            bash "$WL_ENTRY"
         )
         ;;
     bare_multi)
         bare_prereq_check
+        [[ -n "$WL_PRETRAIN_PY" ]] || die "bare_multi requires WL_PRETRAIN_PY in manifest."
         NNODES="$(ask 'Total NNODES' "$DGXNNODES")"
-        NODE_RANK="$(ask_req 'This NODE_RANK (0..NNODES-1)')"
+        NODE_RANK="$(ask_req 'This NODE_RANK')"
         GPUS_PER_NODE="$(ask 'GPUs per node' "$NGPU")"
-        M_ADDR="$(ask_req 'MASTER_ADDR (reachable from all nodes)')"
+        M_ADDR="$(ask_req 'MASTER_ADDR')"
         M_PORT="$(ask 'MASTER_PORT' "$DEFAULT_MPORT")"
-        RDZV_ID="$(ask 'rendezvous id (MUST be same on all nodes)' "mlperf-llama31-8b")"
-        ln -sfn "$DATADIR/8b/tokenizer" "$NEMO_DIR/nemo_tokenizer"
-        export DATADIR LOGDIR SEED PREPROC_DATA_DIR="$DATADIR/8b"
+        RDZV_ID="$(ask 'rendezvous id (same on all nodes)' "mlperf-$WL_NAME")"
+        [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
+            ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
+        export DATADIR LOGDIR SEED
         (
-            cd "$NEMO_DIR"
-            set +u; source config_common.sh && source config_common_cg.sh && source config_common_8b.sh; set -u
-            set +u; source "$CFG_FILE"; set -u
+            cd "$IMPL_DIR"
+            source_configs
             export DGXNGPU="$GPUS_PER_NODE" DGXNNODES="$NNODES" BINDCMD=""
-            say "torchrun multi-node: nnodes=$NNODES node_rank=$NODE_RANK nproc=$GPUS_PER_NODE rdzv=$M_ADDR:$M_PORT"
             torchrun \
                 --nnodes="$NNODES" --node_rank="$NODE_RANK" \
                 --nproc_per_node="$GPUS_PER_NODE" \
                 --rdzv_id="$RDZV_ID" --rdzv_backend=c10d \
                 --rdzv_endpoint="$M_ADDR:$M_PORT" \
-                pretrain.py
+                "$WL_PRETRAIN_PY"
         )
         ;;
     *) die "Unknown method: $METHOD" ;;
@@ -914,8 +910,8 @@ esac
 
 ec=$?
 if (( ec == 0 )); then
-    say "Done. Outputs in: $LOGDIR"
+    say "Done. Outputs: $LOGDIR"
 else
-    err "Exited with code $ec. Check $LOGDIR for details."
+    err "Exit code $ec. See $LOGDIR."
 fi
 exit "$ec"
