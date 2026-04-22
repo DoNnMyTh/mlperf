@@ -4,9 +4,9 @@
 WL_NAME="llama31_405b"
 WL_DISPLAY="Llama 3.1 405B (NeMo)"
 WL_IMPL_SUBDIR="NVIDIA/benchmarks/llama31_405b/implementations/theia_ngpu512_ngc25.09_nemo"
-WL_HUB_REPO=""
+WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="llama31_405b-pyt"
-WL_IMAGE_TAG_VARIANTS=()
+WL_IMAGE_TAG_VARIANTS=("")
 
 # Dataset
 # Final layout: $DATADIR/405b/{c4-*.{bin,idx}, tokenizer/}
