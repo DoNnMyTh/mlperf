@@ -455,7 +455,10 @@ autodetect_defaults() {
     : "${AUTO_SLURM_ACCOUNT:=${SLURM_ACCOUNT:-${SBATCH_ACCOUNT:-}}}"
     : "${AUTO_SLURM_PARTITION:=${SLURM_PARTITION:-${SBATCH_PARTITION:-}}}"
     if [[ -z "$AUTO_SLURM_ACCOUNT" ]] && command -v sacctmgr >/dev/null 2>&1; then
-        AUTO_SLURM_ACCOUNT="$(sacctmgr -n show user "${USER:-}" format=defaultaccount 2>/dev/null | awk '{print $1}' | head -1)"
+        # `timeout` guard — sacctmgr can hang when the slurmdbd is unreachable.
+        if command -v timeout >/dev/null 2>&1; then
+            AUTO_SLURM_ACCOUNT="$(timeout 5 sacctmgr -n show user "${USER:-}" format=defaultaccount 2>/dev/null | awk '{print $1}' | head -1)"
+        fi
     fi
     [[ -n "$AUTO_SLURM_ACCOUNT" ]]   && info "slurm account   : $AUTO_SLURM_ACCOUNT"
     [[ -n "$AUTO_SLURM_PARTITION" ]] && info "slurm partition : $AUTO_SLURM_PARTITION"
@@ -598,8 +601,13 @@ fi
 case "$CHOICE" in
     "docker: build"*)
         IMAGE="$(ask 'Local image name:tag' "mlperf-nvidia:$WL_IMAGE_TAG_BASE")"
+        # Smart default for the patch prompt: if the detected local arch is
+        # one the patch is meant for (sm_89 Ada, sm_90 Hopper), default to
+        # 'y' so the user does not silently get a Blackwell-only image.
+        _patch_default="n"
+        case "$AUTO_GPU_ARCH" in 89|90) _patch_default="y" ;; esac
         if [[ -n "$WL_DOCKERFILE_PATCH_FROM" ]] \
-           && yesno "Patch Dockerfile ($WL_DOCKERFILE_PATCH_FROM -> $WL_DOCKERFILE_PATCH_TO)?" n; then
+           && yesno "Patch Dockerfile for broader sm coverage ($WL_DOCKERFILE_PATCH_FROM -> $WL_DOCKERFILE_PATCH_TO)?" "$_patch_default"; then
             if grep -qF "$WL_DOCKERFILE_PATCH_FROM" Dockerfile; then
                 sed -i "s|$WL_DOCKERFILE_PATCH_FROM|$WL_DOCKERFILE_PATCH_TO|" Dockerfile
                 info "Patched."
@@ -609,9 +617,32 @@ case "$CHOICE" in
                 warn "Pattern not found; skipping."
             fi
         fi
+        # Post-decision sanity check: does the Dockerfile's NVTE_CUDA_ARCHS
+        # include the local GPU's sm? Warn if not — build would succeed but
+        # kernels would fail at runtime.
+        if [[ "$AUTO_GPU_ARCH" != "0" ]]; then
+            _df_archs=$(grep -oE 'NVTE_CUDA_ARCHS="[^"]*"' Dockerfile 2>/dev/null \
+                        | head -1 | sed -E 's/.*="([^"]*)".*/\1/')
+            if [[ -n "$_df_archs" ]]; then
+                _ok=0
+                # Match sm_$arch against any of 89/90/100/103/etc. entries,
+                # ignoring trailing 'a' (PTX/SASS arch suffix).
+                for _a in ${_df_archs//;/ }; do
+                    _a_num="${_a%a}"
+                    [[ "$_a_num" == "$AUTO_GPU_ARCH" ]] && _ok=1
+                done
+                if (( _ok == 0 )); then
+                    warn "Dockerfile NVTE_CUDA_ARCHS='$_df_archs' does not include sm_$AUTO_GPU_ARCH"
+                    warn "Kernels WILL fail at runtime on this GPU."
+                    yesno "Continue with this configuration anyway?" n || die "Aborted. Re-run and accept the patch prompt."
+                fi
+                unset _df_archs _ok _a _a_num
+            fi
+        fi
         need_space_gb "$(dirname "$IMPL_DIR")" 80 "build dir"
         yesno "Run 'docker build' now?" y || die "Cannot run without an image."
         docker build -t "$IMAGE" . || die "build failed"
+        unset _patch_default
         ;;
     "docker: pull"*)
         IMAGE="$(awk '{print $NF}' <<<"$CHOICE")"
