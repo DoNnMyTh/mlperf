@@ -4,9 +4,9 @@
 WL_NAME="dlrm_dcnv2"
 WL_DISPLAY="DLRM DCNv2 (HugeCTR, Criteo 1TB)"
 WL_IMPL_SUBDIR="NVIDIA/benchmarks/dlrm_dcnv2/implementations/hugectr"
-WL_HUB_REPO=""
+WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="recommendation-hugectr"
-WL_IMAGE_TAG_VARIANTS=()
+WL_IMAGE_TAG_VARIANTS=("")
 
 # Dataset: ~4 TB processed (raw train_data.bin + val_data.bin + intermediates).
 # Raw Criteo download is ~1 TB; .gz unpack + NumPy + multi-hot + raw conversion
