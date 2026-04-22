@@ -10,6 +10,24 @@
 set -u
 set -o pipefail
 
+
+# --- mlperf.sh common-lib hook -----------------------------------------
+_MLPERF_LIB_SOURCED=0
+if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
+    # shellcheck source=../lib/common.sh
+    source "$_LIB"
+    _MLPERF_LIB_SOURCED=1
+fi
+# Auto-yes / config-file via env only — no flag parsing here to avoid
+# clobbering per-tool argv handling.
+: "${MLPERF_AUTO_YES:=0}"
+if [[ -n "${MLPERF_CONFIG_FILE:-}" && -f "${MLPERF_CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${MLPERF_CONFIG_FILE}"
+    MLPERF_AUTO_YES=1
+fi
+# -----------------------------------------------------------------------
+
 # ====================================================================
 # bash + TTY guards
 # ====================================================================
@@ -73,6 +91,7 @@ trap 'err "Aborted by signal."; cleanup; exit 130' INT TERM
 trap 'cleanup' EXIT
 
 ask()     { local p="$1" d="${2-}" v=""
+    (( MLPERF_AUTO_YES == 1 )) && { echo "${d-}"; return; }
             if [[ -n "$d" ]]; then read -r -p "$p [$d]: " v; echo "${v:-$d}"
             else                   read -r -p "$p: "        v; echo "$v"; fi
           }
@@ -81,6 +100,7 @@ ask_req() { local p="$1" v=""
                          err "value required"; done
           }
 yesno()   { local p="$1" d="${2-y}" v=""
+    (( MLPERF_AUTO_YES == 1 )) && { [[ "${d-y}" == "y" ]]; return; }
             while :; do read -r -p "$p (y/n) [$d]: " v; v="${v:-$d}"
                 case "$v" in [Yy]|[Yy][Ee][Ss]) return 0;;
                              [Nn]|[Nn][Oo])      return 1;;

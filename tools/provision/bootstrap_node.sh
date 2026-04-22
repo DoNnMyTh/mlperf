@@ -15,6 +15,24 @@
 set -u
 set -o pipefail
 
+
+# --- mlperf.sh common-lib hook -----------------------------------------
+_MLPERF_LIB_SOURCED=0
+if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
+    # shellcheck source=../lib/common.sh
+    source "$_LIB"
+    _MLPERF_LIB_SOURCED=1
+fi
+# Auto-yes / config-file via env only — no flag parsing here to avoid
+# clobbering per-tool argv handling.
+: "${MLPERF_AUTO_YES:=0}"
+if [[ -n "${MLPERF_CONFIG_FILE:-}" && -f "${MLPERF_CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${MLPERF_CONFIG_FILE}"
+    MLPERF_AUTO_YES=1
+fi
+# -----------------------------------------------------------------------
+
 CUDA_REPO_UBUNTU_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
 CUDA_REPO_UBUNTU_URL_2404="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
 NVIDIA_CT_KEYRING_URL="https://nvidia.github.io/libnvidia-container/gpgkey"

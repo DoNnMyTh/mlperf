@@ -14,6 +14,24 @@
 set -u
 set -o pipefail
 
+
+# --- mlperf.sh common-lib hook -----------------------------------------
+_MLPERF_LIB_SOURCED=0
+if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
+    # shellcheck source=../lib/common.sh
+    source "$_LIB"
+    _MLPERF_LIB_SOURCED=1
+fi
+# Auto-yes / config-file via env only — no flag parsing here to avoid
+# clobbering per-tool argv handling.
+: "${MLPERF_AUTO_YES:=0}"
+if [[ -n "${MLPERF_CONFIG_FILE:-}" && -f "${MLPERF_CONFIG_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${MLPERF_CONFIG_FILE}"
+    MLPERF_AUTO_YES=1
+fi
+# -----------------------------------------------------------------------
+
 CUDA_VERSION_SUFFIX="${CUDA_VERSION_SUFFIX:-12-4}"   # for nvidia-fabricmanager-<cuda>
 OFED_URL_DEFAULT="https://content.mellanox.com/ofed/MLNX_OFED-LATEST/MLNX_OFED_LINUX.tgz"
 DOCA_HOST_URL_DEFAULT="https://developer.nvidia.com/doca-download"
@@ -24,6 +42,7 @@ warn() { printf "WARN: %s\n" "$*" >&2; }
 err()  { printf "ERROR: %s\n" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 yesno(){ local p="$1" d="${2-y}" v; while :; do read -r -p "$p (y/n) [$d]: " v; v="${v:-$d}"
+    (( MLPERF_AUTO_YES == 1 )) && { [[ "${d-y}" == "y" ]]; return; }
           case "$v" in [Yy]*) return 0;; [Nn]*) return 1;; esac; done; }
 pick() { local p="$1"; shift; local i=1; for o in "$@"; do printf "  [%d] %s\n" "$i" "$o" >&2; i=$((i+1)); done
          local v; while :; do read -r -p "$p [1]: " v; v="${v:-1}"; [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=$# )) && { echo "$v"; return; }; done; }
