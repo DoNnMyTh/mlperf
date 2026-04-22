@@ -58,4 +58,4 @@ WL_DOC_URL="https://github.com/mlcommons/training_results_v5.1/tree/main/NVIDIA/
 
 # Optional Dockerfile sm_89 patch (for non-Blackwell dev on this workload)
 WL_DOCKERFILE_PATCH_FROM='NVTE_CUDA_ARCHS="100a;103a"'
-WL_DOCKERFILE_PATCH_TO='NVTE_CUDA_ARCHS="89;100a;103a"'
+WL_DOCKERFILE_PATCH_TO='NVTE_CUDA_ARCHS="89;90;100a;103a"'

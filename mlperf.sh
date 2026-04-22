@@ -483,11 +483,25 @@ esac
 if (( NEED_DOCKER == 1 )); then
     require_tool docker; wait_for_docker; check_nvidia
     _local_arch=$(gpu_arch_code)
-    if [[ "$CHOICE" == *"-blackwell"* ]] && (( _local_arch > 0 && _local_arch < 100 )); then
-        warn "Image supports sm_100/103 only; detected GPU sm_$_local_arch."
-        yesno "Continue anyway (kernels will fail at runtime)?" n || die "Aborted."
+    # Per-variant sm_* coverage of the published tags. Update when new
+    # variants (e.g. -sm90 for Hopper) are pushed to the registry.
+    case "$CHOICE" in
+        *"-blackwell"*) _covered="100 103" ;;
+        *"-sm89"*)      _covered="89 100 103" ;;
+        *"-sm90"*)      _covered="89 90 100 103" ;;
+        *)              _covered="" ;;
+    esac
+    if [[ -n "$_covered" && "$_local_arch" != "0" ]]; then
+        _hit=0
+        for _a in $_covered; do [[ "$_local_arch" == "$_a" ]] && _hit=1; done
+        if (( _hit == 0 )); then
+            warn "Image built for sm=[$_covered]; detected GPU sm_$_local_arch."
+            info "  For H100/H200 (sm_90): build locally and accept the Dockerfile"
+            info "  patch prompt so NVTE_CUDA_ARCHS adds '90'."
+            yesno "Continue anyway (kernels will fail at runtime)?" n || die "Aborted."
+        fi
     fi
-    unset _local_arch
+    unset _local_arch _covered _hit _a
 fi
 (( NEED_ENROOT == 1 )) && { require_tool enroot; check_nvidia; }
 

@@ -59,4 +59,4 @@ WL_SMOKE_PROMPTS=(
 
 WL_DOC_URL="https://github.com/mlcommons/training_results_v5.1/tree/main/NVIDIA/benchmarks/llama31_405b/implementations/theia_ngpu512_ngc25.09_nemo"
 WL_DOCKERFILE_PATCH_FROM='NVTE_CUDA_ARCHS="100a;103a"'
-WL_DOCKERFILE_PATCH_TO='NVTE_CUDA_ARCHS="89;100a;103a"'
+WL_DOCKERFILE_PATCH_TO='NVTE_CUDA_ARCHS="89;90;100a;103a"'
