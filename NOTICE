@@ -1,0 +1,57 @@
+mlperf — Interactive Runner for MLPerf Llama 3.1 8B
+====================================================
+
+Copyright (c) 2026 Amit Chaudhry (@DoNnMyTh)
+Released under the MIT License. See LICENSE.
+
+----
+
+This project orchestrates — but does not redistribute — the following
+third-party components. All rights, trademarks, and attributions belong to
+their respective owners.
+
+MLCommons® / MLPerf® Training Reference Implementations
+-------------------------------------------------------
+Source:  https://github.com/mlcommons/training_results_v5.1
+License: Apache License, Version 2.0
+Authors: MLCommons Association and contributing organisations
+
+  "MLPerf" and "MLCommons" are registered trademarks of MLCommons Association.
+  Use of these marks is governed by the MLCommons brand guidelines:
+  https://mlcommons.org/
+
+NVIDIA Corporation — MLPerf v5.1 Submission (Llama 3.1 8B, NeMo)
+----------------------------------------------------------------
+Source:  NVIDIA/benchmarks/llama31_8b/implementations/nemo/
+         within the MLCommons training_results_v5.1 repository
+License: Apache License, Version 2.0
+Authors: NVIDIA Corporation & Affiliates
+
+  Includes Dockerfile, NeMo + Megatron-LM + Transformer Engine + Apex
+  integration scripts, and canonical DGX B200/GB200/GB300 configurations.
+
+Upstream Software Dependencies (referenced, not bundled)
+--------------------------------------------------------
+  * PyTorch                    — https://pytorch.org/                       (BSD-3-Clause)
+  * NVIDIA NeMo                — https://github.com/NVIDIA/NeMo             (Apache-2.0)
+  * NVIDIA Megatron-LM         — https://github.com/NVIDIA/Megatron-LM      (Apache-2.0-ish custom)
+  * NVIDIA Transformer Engine  — https://github.com/NVIDIA/TransformerEngine (Apache-2.0)
+  * NVIDIA Apex                — https://github.com/NVIDIA/apex             (BSD-3-Clause)
+  * Hydra                      — https://hydra.cc/                          (MIT)
+  * PyTorch Lightning          — https://lightning.ai/                      (Apache-2.0)
+  * Enroot                     — https://github.com/NVIDIA/enroot           (Apache-2.0)
+  * Pyxis                      — https://github.com/NVIDIA/pyxis            (Apache-2.0)
+  * Docker                     — https://www.docker.com/                    (Apache-2.0)
+  * Slurm Workload Manager     — https://slurm.schedmd.com/                 (GPL-2.0)
+
+Trademarks
+----------
+NVIDIA, CUDA, NeMo, Megatron, DGX, B200, GB200, GB300, RTX, and related
+product names are trademarks of NVIDIA Corporation.
+"Linux" is a registered trademark of Linus Torvalds.
+"Docker" is a registered trademark of Docker, Inc.
+"GitHub" is a registered trademark of GitHub, Inc.
+
+This project is not endorsed by, sponsored by, or affiliated with
+MLCommons Association, NVIDIA Corporation, Docker, Inc., or any of the
+trademark holders listed above.

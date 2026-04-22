@@ -1,0 +1,28 @@
+# Local runtime artefacts that this tool produces.
+# The tool itself does not write into its own repository, but contributors
+# may keep local experiments here during development.
+
+# Cloned upstream source
+/training_results_v5.1/
+
+# Datasets and outputs
+/mlperf_data/
+/results/
+/logs/
+
+# Container artefacts
+*.sqsh
+*.tar
+Dockerfile.bak
+
+# Editor / OS detritus
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Pytest / build artefacts (if the script grows test coverage)
+__pycache__/
+*.pyc
+.pytest_cache/

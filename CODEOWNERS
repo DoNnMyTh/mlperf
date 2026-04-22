@@ -1,0 +1,18 @@
+# CODEOWNERS — https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# These owners will be automatically requested for review when someone
+# opens a pull request that modifies files matching a pattern below.
+# Last matching pattern takes precedence.
+
+# Default owner: all files require review from the repository owner.
+*                       @DoNnMyTh
+
+# Script — primary maintainer.
+/mlperf_llama31_8b.sh   @DoNnMyTh
+
+# Documentation and policy files.
+/README.md              @DoNnMyTh
+/SECURITY.md            @DoNnMyTh
+/LICENSE                @DoNnMyTh
+/NOTICE                 @DoNnMyTh
+/CODEOWNERS             @DoNnMyTh
