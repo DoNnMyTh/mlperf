@@ -538,8 +538,13 @@ OPTS=(
     "docker: build locally (Dockerfile)"
 )
 for variant in "${WL_IMAGE_TAG_VARIANTS[@]:-}"; do
-    [[ -n "$variant" && -n "$WL_HUB_REPO" ]] && \
+    [[ -n "$WL_HUB_REPO" ]] || continue
+    if [[ -z "$variant" ]]; then
+        # Empty variant == no suffix. Tag is just WL_IMAGE_TAG_BASE.
+        OPTS+=("docker: pull $WL_HUB_REPO:$WL_IMAGE_TAG_BASE")
+    else
         OPTS+=("docker: pull $WL_HUB_REPO:$WL_IMAGE_TAG_BASE-$variant")
+    fi
 done
 (( BARE_OK == 1 )) && OPTS+=("none — bare-metal (use host Python)")
 if (( HAS_ENROOT == 1 )); then

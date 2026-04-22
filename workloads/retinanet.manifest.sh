@@ -4,9 +4,11 @@
 WL_NAME="retinanet"
 WL_DISPLAY="RetinaNet / SSD (PyTorch, OpenImages-v6)"
 WL_IMPL_SUBDIR="NVIDIA/benchmarks/retinanet/implementations/tyche_ngpu8_ngc25.04_pytorch"
-WL_HUB_REPO=""
+WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="single_stage_detector-pyt"
-WL_IMAGE_TAG_VARIANTS=()  # no public pre-built images published from this project
+# Single pushed tag; empty-string variant means "no -<variant> suffix" and
+# pulls donnmyth/mlperf-nvidia:single_stage_detector-pyt as-is.
+WL_IMAGE_TAG_VARIANTS=("")
 
 # Dataset — OpenImages-v6 MLPerf subset
 # Expected layout: $DATADIR/{train,validation}/{data,labels,metadata}/...

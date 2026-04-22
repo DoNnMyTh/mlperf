@@ -4,9 +4,9 @@
 WL_NAME="flux1"
 WL_DISPLAY="FLUX.1 text-to-image (NeMo)"
 WL_IMPL_SUBDIR="NVIDIA/benchmarks/flux1/implementations/theia_ngpu16_ngc25.09_nemo"
-WL_HUB_REPO=""
+WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="flux1-pyt"
-WL_IMAGE_TAG_VARIANTS=()
+WL_IMAGE_TAG_VARIANTS=("")
 
 # Dataset — Energon WebDataset format after preprocessing.
 # Final layout: $DATADIR/energon/{train/*.tar,val/*.tar,empty_encodings/}
