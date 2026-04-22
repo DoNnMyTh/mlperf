@@ -7,8 +7,9 @@
 # Default owner: all files require review from the repository owner.
 *                       @DoNnMyTh
 
-# Script — primary maintainer.
-/mlperf_llama31_8b.sh   @DoNnMyTh
+# Driver + workload manifests — primary maintainer.
+/mlperf.sh              @DoNnMyTh
+/workloads/             @DoNnMyTh
 
 # Documentation and policy files.
 /README.md              @DoNnMyTh

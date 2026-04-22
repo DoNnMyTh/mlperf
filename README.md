@@ -1,10 +1,22 @@
-# MLPerf Llama 3.1 8B Interactive Runner
+# MLPerf Training v5.1 — Interactive Runner
 
 [![MLPerf](https://img.shields.io/badge/MLPerf-Training%20v5.1-76B900)](https://mlcommons.org/benchmarks/training/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%2FWSL2-lightgrey)](#supported-platforms)
 
-A single, self-contained, idempotent Bash script that guides an operator through the full lifecycle of running the NVIDIA MLPerf Training v5.1 submission for Llama 3.1 8B — from source checkout through container provisioning, dataset ingestion, configuration selection, and benchmark launch — across heterogeneous target environments (workstations, single-node Docker hosts, and multi-node Slurm clusters).
+A single, self-contained, idempotent Bash driver that guides an operator through the full lifecycle of running any NVIDIA MLPerf Training v5.1 submission — from source checkout through container provisioning, dataset ingestion, configuration selection, and benchmark launch — across heterogeneous target environments (workstations, single-node Docker hosts, and multi-node Slurm clusters). Workloads are contributed as lightweight manifest files; the driver itself stays workload-agnostic.
+
+## Supported Workloads
+
+| Workload | Domain | Dataset | Impl Path |
+|----------|--------|---------|-----------|
+| `llama31_8b` | LLM pretrain | C4 (preprocessed) | `llama31_8b/implementations/nemo` |
+| `llama31_405b` | LLM pretrain | C4 + Mixtral 8x22b tokenizer | `llama31_405b/implementations/theia_ngpu512_ngc25.09_nemo` |
+| `llama2_70b_lora` | LLM fine-tune | GovReport | `llama2_70b_lora/implementations/nemo` |
+| `flux1` | Text-to-image | CC12M + COCO (Energon) | `flux1/implementations/theia_ngpu16_ngc25.09_nemo` |
+| `retinanet` | Object detection | OpenImages-v6 (MLPerf subset) | `retinanet/implementations/tyche_ngpu8_ngc25.04_pytorch` |
+| `dlrm_dcnv2` | Recommendation | Criteo 1TB | `dlrm_dcnv2/implementations/hugectr` |
+| `rgat` | Graph neural net | IGBH-Full | `rgat/implementations/tyche_ngpu8_ngc25.03_dgl` |
 
 ---
 
@@ -29,30 +41,29 @@ A single, self-contained, idempotent Bash script that guides an operator through
 
 ## 1. Executive Summary
 
-Reproducing the NVIDIA MLPerf training submissions is an involved, error-prone exercise. A typical attempt requires the operator to:
+Reproducing the NVIDIA MLPerf training submissions is an involved, error-prone exercise. A typical attempt, per workload, requires the operator to:
 
 - Clone a large multi-vendor repository and navigate to a specific submission path.
-- Build (or pull) a carefully-versioned CUDA/PyTorch container with customised Transformer Engine, Megatron-LM, NeMo, and Apex source trees.
-- Stage ~80 GB of preprocessed C4 shards and the Llama 3.1 tokenizer under a rigid directory layout.
+- Build (or pull) a carefully-versioned CUDA/PyTorch container with customised Transformer Engine, Megatron-LM, NeMo, HugeCTR, DGL, or Apex source trees.
+- Stage anywhere from 300 GB (Llama 2 70B LoRA) to 8 TB (DLRM Criteo 1TB) of preprocessed data under a rigid directory layout.
 - Choose an appropriate topology configuration (nodes × GPUs × parallelism degrees) from a matrix of canonical `config_*.sh` files tailored to DGX B200, GB200, GB300, etc.
 - Launch via a Slurm+Pyxis+Enroot submission script that assumes a very particular scheduler environment.
 
 Every one of these steps has multiple common failure modes: wrong image architecture, truncated downloads, nested directories, path-translation quirks on Windows, registry authentication, and dozens of environment-variable contracts between configuration files and the training launcher.
 
-This tool collapses that workflow into a single interactive script that (a) prompts for every consequential choice, (b) auto-detects and installs missing tooling where possible, (c) adapts its launch strategy to the detected environment (cluster vs. workstation, container vs. bare-metal), and (d) degrades gracefully when full MLPerf compliance is not achievable (e.g., on consumer-grade GPUs). The script is intentionally self-contained — a single ~900-line Bash file with zero runtime dependencies beyond standard POSIX utilities — so it can be audited, reviewed, and distributed as an artefact alongside the MLPerf submission.
+This tool collapses that workflow into a single interactive driver (`mlperf.sh`) backed by per-workload manifests (`workloads/<name>.manifest.sh`). The driver (a) prompts for every consequential choice, (b) auto-detects and installs missing tooling where possible, (c) adapts its launch strategy to the detected environment (cluster vs. workstation, container vs. bare-metal), and (d) degrades gracefully when full MLPerf compliance is not achievable (e.g., on consumer-grade GPUs). Adding a new workload means dropping a ~50-line manifest file; the driver itself does not change. The driver is intentionally self-contained — a single ~900-line Bash file with zero runtime dependencies beyond standard POSIX utilities — so it can be audited, reviewed, and distributed as an artefact alongside the MLPerf submission.
 
 ---
 
 ## 2. Scope & Non-Goals
 
 ### In Scope
-- Reproduction of the **NVIDIA Llama 3.1 8B NeMo** submission from `mlcommons/training_results_v5.1`.
+- Reproduction of any NVIDIA MLPerf Training v5.1 submission shipped under `NVIDIA/benchmarks/<workload>/implementations/` in `mlcommons/training_results_v5.1`, selected via a manifest picker at launch time.
 - Four execution modalities: Docker (single node), Enroot/Pyxis (cluster), bare-metal Python (single or multi-node), and prepare-only (staging without launch).
 - Assisted tooling installation on Debian/RHEL/Arch/SUSE/Alpine Linux; guided installation on macOS and Windows/WSL2.
 - Interactive runtime configuration, GPU subset selection, and disk-space pre-flight checks.
 
 ### Not In Scope
-- Reproduction of other MLPerf workloads (GPT3, ResNet, etc.).
 - Automated model weight conversion, post-training evaluation, or result submission to MLCommons.
 - Cluster provisioning (node bring-up, Slurm installation, MIG partitioning).
 - Compliance certification. MLPerf-compliant runs **must** use the `sbatch run.sub` path on the officially supported hardware topology.
@@ -198,10 +209,29 @@ The script maintains a small, well-defined set of globals that accumulate across
 ```bash
 git clone https://github.com/DoNnMyTh/mlperf.git
 cd mlperf
-bash mlperf_llama31_8b.sh
+bash mlperf.sh
 ```
 
-The script is idempotent — re-running it will detect existing artefacts (repo, image, dataset) and offer to reuse them.
+At launch time the driver will list all `workloads/*.manifest.sh` files and ask which workload to run. All subsequent prompts (repo, image, dataset, config, launcher) are then specialised for that workload. The script is idempotent — re-running it will detect existing artefacts and offer to reuse them.
+
+### Adding a new workload
+
+Drop a new file `workloads/<name>.manifest.sh` defining the `WL_*` contract:
+
+```bash
+WL_NAME="my_workload"
+WL_DISPLAY="Human-readable name"
+WL_IMPL_SUBDIR="NVIDIA/benchmarks/my_workload/implementations/<impl>"
+WL_IMAGE_TAG_BASE="my_workload-pyt"
+WL_DATASET_SUBDIR="mydata"
+WL_DATASET_MARKER_FILES=("train.bin")
+WL_PREPROC_HOST_SUBPATH="mydata"
+WL_PREPROC_MOUNT="/data"
+WL_ENTRY="run_and_time.sh"
+# ... see workloads/llama31_8b.manifest.sh for the full contract
+```
+
+No changes to `mlperf.sh` are required.
 
 ### 6.2 Offline Cluster Installation
 
@@ -233,12 +263,12 @@ The script will accept all three as local paths and skip the corresponding downl
 
 ```bash
 # On a workstation with a single GPU (verification / smoke test):
-bash mlperf_llama31_8b.sh
-# → choose: pull image → download dataset → custom smoke → docker/bare
+bash mlperf.sh
+# → choose: workload → pull image → download dataset → custom smoke → docker/bare
 
 # On a cluster login node:
-bash mlperf_llama31_8b.sh
-# → choose: existing repo → enroot sqsh → sbatch run.sub
+bash mlperf.sh
+# → choose: workload → existing repo → enroot sqsh → sbatch run.sub
 ```
 
 ### 7.2 Prepare-Only Mode
@@ -246,7 +276,7 @@ bash mlperf_llama31_8b.sh
 Use `prepare-only` when you want the script to do all the heavy lifting (clone, build, download, configure) but emit the launch command rather than executing it. Useful for air-gapped environments or when the launch itself will be performed via a separate automation tool.
 
 ```bash
-bash mlperf_llama31_8b.sh
+bash mlperf.sh
 # ... all six phases complete ...
 # → choose: prepare-only
 ```
@@ -378,7 +408,7 @@ The script explicitly handles the following edge cases, all of which are real fa
 | Symptom | Likely Cause | Resolution |
 |---------|-------------|-----------|
 | `ERROR: non-interactive stdin` | Piped or CI execution | Run in a real terminal |
-| `ERROR: Bash >= 4 required` | macOS default `/bin/bash` (3.2) | `brew install bash && /opt/homebrew/bin/bash mlperf_llama31_8b.sh` |
+| `ERROR: Bash >= 4 required` | macOS default `/bin/bash` (3.2) | `brew install bash && /opt/homebrew/bin/bash mlperf.sh` |
 | `Docker daemon unreachable` | Docker Desktop not started | Start Docker Desktop; script will wait up to 3 min |
 | `unauthorized: authentication required` during pull | Private registry or rate limit | Accept the `docker login` prompt |
 | `CUDA Error: no kernel image is available` | Image built for different sm than host GPU | Rebuild with correct `NVTE_CUDA_ARCHS` or pull the `-sm89` tag |

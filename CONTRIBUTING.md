@@ -21,10 +21,10 @@ Before pushing a change to the script:
 
 ```bash
 # Syntax check
-bash -n mlperf_llama31_8b.sh
+bash -n mlperf.sh
 
 # Static analysis
-shellcheck mlperf_llama31_8b.sh
+shellcheck mlperf.sh
 ```
 
 ## Pull Request Workflow
