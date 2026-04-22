@@ -5,9 +5,9 @@
 WL_NAME="rgat"
 WL_DISPLAY="R-GAT (DGL, IGBH-Full graph)"
 WL_IMPL_SUBDIR="NVIDIA/benchmarks/rgat/implementations/tyche_ngpu8_ngc25.03_dgl"
-WL_HUB_REPO=""
+WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="graph_neural_network-dgl"
-WL_IMAGE_TAG_VARIANTS=()
+WL_IMAGE_TAG_VARIANTS=("")
 
 # Dataset
 # After preprocessing the final layout is:

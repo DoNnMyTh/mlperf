@@ -41,5 +41,14 @@ WL_SMOKE_ENV=()
 WL_SMOKE_PROMPTS=()
 
 WL_DOC_URL="https://github.com/mlcommons/training_results_v5.1/tree/main/NVIDIA/benchmarks/dlrm_dcnv2/implementations/hugectr"
-WL_DOCKERFILE_PATCH_FROM=""
-WL_DOCKERFILE_PATCH_TO=""
+
+# Upstream requirements.txt pins mpi4py==3.1.5 which fails on the NGC 25.03
+# base because setuptools ≥ 70 removed the `dry_run=` kwarg from
+# distutils.ccompiler.new_compiler(), yielding:
+#   TypeError: new_compiler() got an unexpected keyword argument 'dry_run'
+# Rewrite the Dockerfile's pip-install step to bump mpi4py to 4.0+ (which
+# ships pep517 build metadata) before pip runs.
+# The driver applies the patch via `sed -i "s|FROM|TO|" Dockerfile`, so the
+# inner sed we inject must not use `|` as its delimiter. Use `#` instead.
+WL_DOCKERFILE_PATCH_FROM='RUN pip3 install --no-cache-dir -r requirements.txt'
+WL_DOCKERFILE_PATCH_TO='RUN sed -i '\''s#^mpi4py==3\\.1\\.5#mpi4py>=4.0,<4.2#'\'' requirements.txt \&\& pip3 install --no-cache-dir -r requirements.txt'
