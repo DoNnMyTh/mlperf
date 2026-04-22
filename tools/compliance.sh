@@ -105,7 +105,7 @@ say "[1/5] compliance_checker"
 declare -a PASSED=() FAILED=()
 for log in "${LOGS[@]}"; do
     if docker run --rm --ipc=host -v "$(dirname "$log"):/l:ro" "$IMAGE" bash -lc "
-        pip install -q 'mlperf_logging>=3.0.0' 2>/dev/null || true
+        pip install -q 'mlperf_logging==3.1.0' 2>/dev/null || true
         python -m mlperf_logging.compliance_checker --usage training --ruleset 5.1.0 /l/$(basename "$log")
     " >/dev/null 2>&1; then
         PASSED+=("$log")

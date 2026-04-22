@@ -41,6 +41,9 @@ DOCKER_GPG_URL="https://download.docker.com/linux/ubuntu/gpg"
 ENROOT_DEB_URL_TEMPLATE="https://github.com/NVIDIA/enroot/releases/download/v3.5.0/enroot_3.5.0-1_%ARCH%.deb"
 ENROOT_HOOKS_DEB_URL_TEMPLATE="https://github.com/NVIDIA/enroot/releases/download/v3.5.0/enroot+caps_3.5.0-1_%ARCH%.deb"
 PYXIS_VERSION="0.20.0"
+# Immutable SHA corresponding to the v0.20.0 tag (at time of writing).
+# Override via PYXIS_SHA=<sha> env var.
+PYXIS_SHA="${PYXIS_SHA:-5fa3c38c73aab30adb9f7a1ff3c37b89d0938a43}"
 # Slurm version here is informational. The script installs the distro's
 # packaged Slurm (apt: slurm-wlm, dnf: slurm). Override by configuring an
 # upstream Slurm repo before running this script if a specific version is
@@ -221,8 +224,8 @@ done
 if (( PYXIS_INSTALLED == 0 )); then
     pkg_install git
     TD=$(mktemp -d)
-    git clone --depth 1 -b "v${PYXIS_VERSION}" https://github.com/NVIDIA/pyxis.git "$TD/pyxis"
-    ( cd "$TD/pyxis" && make && $SUDO make install )
+    git clone https://github.com/NVIDIA/pyxis.git "$TD/pyxis"
+    ( cd "$TD/pyxis" && git checkout "$PYXIS_SHA" && make && $SUDO make install )
     rm -rf "$TD"
 fi
 # Register with Slurm
