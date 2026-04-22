@@ -32,10 +32,13 @@ A single, self-contained, idempotent Bash driver that guides an operator through
 8. [Runtime Matrix](#8-runtime-matrix)
 9. [Workflow](#9-workflow)
 10. [Edge Cases Handled](#10-edge-cases-handled)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Security Considerations](#12-security-considerations)
-13. [Contributing](#13-contributing)
-14. [License & Attribution](#14-license--attribution)
+11. [Operator Toolkit (`tools/`)](#11-operator-toolkit-tools)
+12. [Cluster Provisioning](#12-cluster-provisioning)
+13. [Compliance Certification](#13-compliance-certification)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Security Considerations](#15-security-considerations)
+16. [Contributing](#16-contributing)
+17. [License & Attribution](#17-license--attribution)
 
 ---
 
@@ -62,11 +65,18 @@ This tool collapses that workflow into a single interactive driver (`mlperf.sh`)
 - Four execution modalities: Docker (single node), Enroot/Pyxis (cluster), bare-metal Python (single or multi-node), and prepare-only (staging without launch).
 - Assisted tooling installation on Debian/RHEL/Arch/SUSE/Alpine Linux; guided installation on macOS and Windows/WSL2.
 - Interactive runtime configuration, GPU subset selection, and disk-space pre-flight checks.
+- **Model weight conversion** (HF ↔ NeMo) for all LLM workloads — `tools/convert_weights.sh`.
+- **Post-training evaluation** and MLPerf log parsing — `tools/eval.sh`.
+- **Submission packaging** in MLCommons' `training_results_vX.Y/<submitter>/...` layout — `tools/submit.sh`.
+- **Cluster provisioning** (single-node bootstrap for Ubuntu 22.04/24.04 + RHEL 9: NVIDIA driver, Docker, Enroot, Slurm, Pyxis, MIG helper) — `tools/provision/bootstrap_node.sh`.
+- **Compliance certification** (mechanical checks for closed-division submissions) — `tools/compliance.sh`.
 
 ### Not In Scope
-- Automated model weight conversion, post-training evaluation, or result submission to MLCommons.
-- Cluster provisioning (node bring-up, Slurm installation, MIG partitioning).
-- Compliance certification. MLPerf-compliant runs **must** use the `sbatch run.sub` path on the officially supported hardware topology.
+- Pushing the final submission to MLCommons. `tools/submit.sh` prepares the tarball; PR submission is the operator's responsibility.
+- Multi-node cluster orchestration (Ansible/Terraform). Single-node bootstrap is covered; multi-node is documented as a wrapper around `bootstrap_node.sh`.
+- Fabric-manager / NVSwitch / InfiniBand driver tuning. Vendor-specific; follow NVIDIA OEM guides.
+- Shared filesystem deployment (Lustre, GPFS, BeeGFS).
+- Compliance **attestation**. The tool performs mechanical checks; final compliance is certified by the MLCommons submitter working group.
 
 ---
 
@@ -401,7 +411,120 @@ The script explicitly handles the following edge cases, all of which are real fa
 
 ---
 
-## 11. Troubleshooting
+## 11. Operator Toolkit (`tools/`)
+
+Four single-file utilities for the lifecycle around training:
+
+| Tool | Purpose | Container required? |
+|------|---------|:-------------------:|
+| [`tools/convert_weights.sh`](tools/convert_weights.sh) | HF ↔ NeMo weight conversion (Llama 3.1 8B / 405B / Llama 2 70B LoRA) | ✓ (workload image) |
+| [`tools/eval.sh`](tools/eval.sh) | Parse MLLOG training logs; run `mlperf_logging.compliance_checker`; summarise convergence | ✓ |
+| [`tools/submit.sh`](tools/submit.sh) | Package a full MLCommons submission tarball (`<submitter>/{systems,benchmarks,results}`) | ✓ |
+| [`tools/compliance.sh`](tools/compliance.sh) | Mechanical closed-division compliance gate (checker + distinct seeds + run counts + time-to-train + Slurm evidence) | ✓ |
+
+Each tool is interactive and mirrors the driver's UI conventions (`ask`, `yesno`, `pick`). They run the container-dependent steps (compliance checker, NeMo conversion) inside the workload image so the host never needs the NeMo / mlperf_logging Python stack.
+
+### 11.1 Weight Conversion — `tools/convert_weights.sh`
+
+```bash
+bash tools/convert_weights.sh
+# → picker: llama31_8b / llama31_405b / llama2_70b_lora
+# → direction: HF -> NeMo  |  NeMo -> HF  |  merge LoRA (70B only)
+# → source + destination paths on host
+```
+
+Under the hood, for Llama 3.1 variants the tool calls `nemo.collections.llm.import_ckpt` / `export_ckpt` inside the container. For Llama 2 70B LoRA it wraps `scripts/convert_model.py` from the workload source tree.
+
+### 11.2 Post-Training Eval — `tools/eval.sh`
+
+Accepts an MLLOG-formatted log (or NeMo stdout containing `:::MLLOG` lines):
+
+```bash
+bash tools/eval.sh
+# → pick workload; quality target is shown in the picker
+# → point at result_*.txt
+# → compliance_checker runs; run_start/run_stop/eval events are parsed; last
+#   eval value + run_stop status are printed.
+```
+
+Exits non-zero on compliance failure; prints a one-line `STATUS=<workload>:{PASS|FAIL}` for machine consumption.
+
+### 11.3 Submission Packaging — `tools/submit.sh`
+
+Assembles the MLCommons `training_results_vX.Y` submission layout:
+
+```
+<submitter>/
+  systems/<system_desc>.json
+  benchmarks/<workload>/implementations/<impl>/<source>
+  results/<system_desc>/<workload>/
+    result_*.txt
+    compliance_checker_log.txt
+```
+
+The tool runs the compliance checker against every `result_*.txt` as a gate, copies implementation source from the user's `training_results_v5.1` clone, generates a `systems/<desc>.json` skeleton with FIXME fields, and produces a tarball ready for a PR against `mlcommons/training_results_vX.Y`. The tool does **not** push to MLCommons.
+
+### 11.4 Closing Over a Submission — `tools/compliance.sh`
+
+See [Section 13 — Compliance Certification](#13-compliance-certification).
+
+---
+
+## 12. Cluster Provisioning
+
+A fresh cluster node can be brought to "can run MLPerf" state by a single idempotent script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DoNnMyTh/mlperf/master/tools/provision/bootstrap_node.sh | sudo bash
+```
+
+What it installs, in order:
+
+1. Build chain: `linux-headers`, `dkms`, `build-essential`.
+2. **NVIDIA data-centre driver** via the official CUDA repo (Ubuntu 22.04/24.04 and RHEL 9).
+3. **NVIDIA Container Toolkit**, configured as a Docker runtime.
+4. **Docker CE**.
+5. **Enroot** 3.5.0 (DEB install; RHEL users build from source upstream).
+6. **Munge** + **Slurm** 23.11.6 (workload manager).
+7. **Pyxis** 0.20.0 SPANK plugin (built from source, registered with Slurm).
+8. Kernel tuning: `vm.nr_hugepages`, TCP buffers, `memlock` / `stack` limits.
+9. `/usr/local/sbin/mlperf-mig` helper wrapping `nvidia-smi mig`.
+
+Also shipped: `tools/provision/slurm.conf.example` (GPU-aware `NodeName` / `Partition` template) and [`tools/provision/README.md`](tools/provision/README.md) with head-node vs. compute-node setup, MIG partitioning, verification commands, and explicit non-goals (fabric manager, OFED tuning, shared filesystem mount). For multi-node orchestration at scale, wrap `bootstrap_node.sh` in an Ansible role (template in the README).
+
+---
+
+## 13. Compliance Certification
+
+MLPerf-compliant (closed-division) submissions **must** be launched via `sbatch run.sub` on officially supported hardware. The driver labels every non-`sbatch` launcher as "not MLPerf-compliant" in the picker and emits an explicit warning after such a run completes.
+
+[`tools/compliance.sh`](tools/compliance.sh) is the local gate an operator should run against a completed `sbatch` sweep. It performs five checks, in order:
+
+| # | Check | Source of truth |
+|---|-------|-----------------|
+| 1 | Every `result_*.txt` passes `mlperf_logging.compliance_checker --usage training --ruleset 5.1.0` | MLCommons rules (https://github.com/mlcommons/training_policies) |
+| 2 | Every successful run has a **distinct seed** | Extracted from MLLOG `seed` / script `SEED=` |
+| 3 | Minimum **number of successful convergences** per workload (e.g. 3 for llama31_8b, 10 for rgat) | `training_policies` |
+| 4 | **Time-to-train** geomean across successful runs | MLLOG `run_start`/`run_stop` timestamps |
+| 5 | **Slurm-launcher evidence** per run (SLURM_JOB_ID / srun / sbatch strings in log) | Heuristic |
+
+On all-green the tool exits 0 and points the operator at `tools/submit.sh`. On any failure it exits 1 with a per-check breakdown. The tool cannot **attest** compliance — final certification remains with the MLCommons submitter working group — but it catches every mechanical issue an MLCommons reviewer would otherwise raise.
+
+### 13.1 Typical Closed-Division Workflow
+
+```bash
+# On the cluster head node, for N times (e.g. N=3 for llama31_8b):
+bash mlperf.sh   # → pick workload → sbatch run.sub → different SEED each time
+
+# When all runs complete:
+bash tools/compliance.sh       # → point at $LOGDIR
+bash tools/submit.sh           # → generate submission tarball
+# Open a PR against mlcommons/training_results_v5.1
+```
+
+---
+
+## 14. Troubleshooting
 
 ### 11.1 Common Issues
 
@@ -428,7 +551,7 @@ The script explicitly handles the following edge cases, all of which are real fa
 
 ---
 
-## 12. Security Considerations
+## 15. Security Considerations
 
 - **Sudo escalation** requires explicit per-command confirmation; the script never silently elevates privileges.
 - **Credentials** are never written to the script's state; authentication for Docker Hub and Enroot is delegated to the respective CLIs.
@@ -439,7 +562,7 @@ The script explicitly handles the following edge cases, all of which are real fa
 
 ---
 
-## 13. Contributing
+## 16. Contributing
 
 Contributions are welcome. Please ensure:
 
@@ -451,7 +574,7 @@ Contributions are welcome. Please ensure:
 
 ---
 
-## 14. License & Attribution
+## 17. License & Attribution
 
 This tool is released under the MIT License. See `LICENSE` for details.
 
