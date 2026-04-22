@@ -50,7 +50,16 @@ case "$OS_ID" in
 esac
 info "OS: $OS_ID $OS_VER   arch: $ARCH_DEB   pkg: $PKG"
 
-pkg_update() { [[ "$PKG" == "apt-get" ]] && $SUDO apt-get update || $SUDO $PKG makecache -y; }
+pkg_update() {
+    # Explicit if/else — the prior `A && B || C` form would silently run
+    # `$PKG makecache` after `apt-get update` failures, which on APT is an
+    # invalid subcommand.
+    if [[ "$PKG" == "apt-get" ]]; then
+        $SUDO apt-get update
+    else
+        $SUDO $PKG makecache -y
+    fi
+}
 pkg_install() {
     if [[ "$PKG" == "apt-get" ]]; then
         DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y --no-install-recommends "$@"

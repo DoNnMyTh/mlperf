@@ -190,9 +190,20 @@ wait_for_docker() {
 }
 
 docker_pull_with_auth() {
-    local img="$1"
-    if docker pull "$img" 2>&1 | tee /tmp/.pull.$$ | grep -qE "unauthorized|denied|authentication required|401"; then
-        rm -f /tmp/.pull.$$
+    local img="$1" tmp rc
+    tmp="/tmp/.pull.$$"
+    # Run docker pull separately so we can distinguish "pull failed (auth)"
+    # from "pull failed (network/404/disk)". pipefail would otherwise hide
+    # non-auth failures behind a failed grep.
+    docker pull "$img" >"$tmp" 2>&1
+    rc=$?
+    cat "$tmp"
+    if (( rc == 0 )); then
+        rm -f "$tmp"
+        return 0
+    fi
+    if grep -qE "unauthorized|denied|authentication required|401" "$tmp"; then
+        rm -f "$tmp"
         warn "Pull failed — private registry?"
         local host; host="$(awk -F'/' '{print $1}' <<<"$img")"
         [[ "$host" != *.* ]] && host="docker.io"
@@ -200,7 +211,8 @@ docker_pull_with_auth() {
         docker login "$host" || die "docker login failed"
         docker pull "$img" || die "pull still failed"
     else
-        rm -f /tmp/.pull.$$
+        rm -f "$tmp"
+        die "docker pull failed (exit $rc) — not an auth error. Check network / image name / disk."
     fi
 }
 
@@ -412,7 +424,7 @@ else
 fi
 IMPL_DIR="$REPO_DIR/$WL_IMPL_SUBDIR"
 [[ -f "$IMPL_DIR/Dockerfile" ]] || die "Dockerfile missing at $IMPL_DIR"
-cd "$IMPL_DIR"
+cd "$IMPL_DIR" || die "cd to $IMPL_DIR failed"
 info "CWD: $PWD"
 
 # ====================================================================
@@ -644,8 +656,10 @@ if (( IS_CUSTOM == 1 )); then
     if (( NGPU > 1 )); then
         warn "Custom smoke is 1-GPU only; NGPU=1"
         NGPU=1
-        export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-        export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
+        # Pick the first GPU from the current CVD, or 0 if CVD unset.
+        _cvd_first="${CUDA_VISIBLE_DEVICES:-0}"
+        export CUDA_VISIBLE_DEVICES="${_cvd_first%%,*}"
+        unset _cvd_first
     fi
 else
     set +u
@@ -855,12 +869,13 @@ case "$METHOD" in
         track_container "$CNAME"
         docker run --name "$CNAME" "${docker_common_args[@]}" \
             "$IMAGE" bash -c "
-                cd $WL_CONTAINER_WORKDIR &&
-                [ -f config_common.sh ] && source config_common.sh
-                [ -f config_common_cg.sh ] && source config_common_cg.sh
-                [ -f config_common_8b.sh ] && source config_common_8b.sh
-                source $CFG_FILE &&
-                export DGXNGPU=$NGPU DGXNNODES=1 BINDCMD='' &&
+                set -e
+                cd $WL_CONTAINER_WORKDIR
+                [ -f config_common.sh ]    && source config_common.sh    || true
+                [ -f config_common_cg.sh ] && source config_common_cg.sh || true
+                [ -f config_common_8b.sh ] && source config_common_8b.sh || true
+                source $CFG_FILE
+                export DGXNGPU=$NGPU DGXNNODES=1 BINDCMD=''
                 bash $WL_ENTRY
             "
         ;;
@@ -870,7 +885,7 @@ case "$METHOD" in
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
             ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         (
-            cd "$IMPL_DIR"
+            cd "$IMPL_DIR" || exit 1
             source_configs
             export DGXNGPU="$NGPU" DGXNNODES=1 BINDCMD=""
             bash "$WL_ENTRY"
@@ -883,11 +898,12 @@ case "$METHOD" in
         docker run --name "$CNAME" "${docker_common_args[@]}" \
             -e SLURM_JOB_ID=smoke \
             "$IMAGE" bash -c "
-                cd $WL_CONTAINER_WORKDIR &&
-                [ -f config_common.sh ] && source config_common.sh
-                [ -f config_common_cg.sh ] && source config_common_cg.sh
-                [ -f config_common_8b.sh ] && source config_common_8b.sh
-                export $SMOKE_STR &&
+                set -e
+                cd $WL_CONTAINER_WORKDIR
+                [ -f config_common.sh ]    && source config_common.sh    || true
+                [ -f config_common_cg.sh ] && source config_common_cg.sh || true
+                [ -f config_common_8b.sh ] && source config_common_8b.sh || true
+                export $SMOKE_STR
                 bash $WL_ENTRY
             "
         ;;
@@ -897,7 +913,7 @@ case "$METHOD" in
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
             ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         (
-            cd "$IMPL_DIR"
+            cd "$IMPL_DIR" || exit 1
             source_configs
             export "${WL_SMOKE_ENV[@]}"
             for k in "${!SMOKE_PROMPT_VALUES[@]}"; do export "$k=${SMOKE_PROMPT_VALUES[$k]}"; done
@@ -917,7 +933,7 @@ case "$METHOD" in
             ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         export DATADIR LOGDIR SEED
         (
-            cd "$IMPL_DIR"
+            cd "$IMPL_DIR" || exit 1
             source_configs
             export DGXNGPU="$GPUS_PER_NODE" DGXNNODES="$NNODES" BINDCMD=""
             torchrun \
