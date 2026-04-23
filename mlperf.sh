@@ -96,6 +96,7 @@ ask()     { local p="$1" d="${2-}" v=""
             else                   read -r -p "$p: "        v; echo "$v"; fi
           }
 ask_req() { local p="$1" v=""
+    (( MLPERF_AUTO_YES == 1 )) && { err "required value '$p' not supplied in non-interactive mode"; exit 1; }
             while :; do read -r -p "$p: " v; [[ -n "$v" ]] && { echo "$v"; return; }
                          err "value required"; done
           }
@@ -109,6 +110,7 @@ yesno()   { local p="$1" d="${2-y}" v=""
           }
 pick()    { local p="$1"; shift
             local i=1; for o in "$@"; do printf "  [%d] %s\n" "$i" "$o" >&2; i=$((i+1)); done
+    (( MLPERF_AUTO_YES == 1 )) && { echo 1; return; }
             local v=""
             while :; do read -r -p "$p [1]: " v; v="${v:-1}"
                 [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=$# )) && { echo "$v"; return; }

@@ -88,6 +88,9 @@ info "Workload: $WL   System: $SYS"
 BRANCH="submission/${WL}/${SYS}/$(date +%Y%m%d-%H%M%S)"
 WORK="$(mktemp -d)"
 info "Scratch: $WORK"
+# Trap so the multi-GB fork clone does not leak under /tmp on abort.
+trap 'rm -rf "$WORK"' EXIT
+trap 'err "aborted"; rm -rf "$WORK"; exit 130' INT TERM
 
 # -----------------------------------------------------------------
 # Fork + clone

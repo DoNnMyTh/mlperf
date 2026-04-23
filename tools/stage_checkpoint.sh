@@ -36,7 +36,7 @@ done
 : "${HF_REPO:?HF_REPO env var required (e.g. meta-llama/Llama-3.1-405B)}"
 : "${CKPT_DIR:?CKPT_DIR env var required — host path where hf_ckpt/ and ckpt/ will live}"
 
-mkdir -p "$CKPT_DIR/hf_ckpt" "$CKPT_DIR/ckpt"
+mkdir -p "$CKPT_DIR/hf_ckpt" "$CKPT_DIR/ckpt/$WL"
 
 echo "[1/3] Downloading $HF_REPO -> $CKPT_DIR/hf_ckpt"
 if command -v huggingface-cli >/dev/null 2>&1; then
@@ -54,14 +54,45 @@ snapshot_download(repo_id=os.environ["HF_REPO"],
 PY
 fi
 
-echo "[2/3] Converting HF -> NeMo via tools/convert_weights.sh"
-MLPERF_AUTO_YES=1 \
-    MLPERF_CONFIG_FILE=/dev/stdin \
-    bash "$(dirname "${BASH_SOURCE[0]}")/convert_weights.sh" <<EOF
-# Pre-seed answers for convert_weights.sh picker prompts.
-# (convert_weights.sh honours MLPERF_AUTO_YES and returns the default at
-# every prompt; the manifest selection is position 1 in the sorted list.)
-EOF
+echo "[2/3] Converting HF -> NeMo for workload '$WL' (direct docker invocation)"
+# Previously this delegated to tools/convert_weights.sh with MLPERF_AUTO_YES,
+# but AUTO_YES picks the FIRST manifest alphabetically (dlrm_dcnv2) — not
+# the workload the operator passed via --workload. Run the conversion
+# directly here so --workload actually wires through.
+MANIFEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/../workloads" && pwd)/$WL.manifest.sh"
+[[ -f "$MANIFEST" ]] || { echo "manifest not found: $MANIFEST" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$MANIFEST"
+IMAGE="${IMAGE:-mlperf-nvidia:${WL_IMAGE_TAG_BASE}}"
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || { echo "Image $IMAGE not found. Pull or build first." >&2; exit 1; }
+case "$WL" in
+    llama31_8b|llama31_405b)
+        SIZE="${WL_DATASET_SUBDIR}"
+        docker run --rm --gpus all --ipc=host --shm-size=8g \
+            -v "$CKPT_DIR/hf_ckpt:/src:ro" \
+            -v "$CKPT_DIR/ckpt/$WL:/dst" \
+            -e SIZE="$SIZE" \
+            "$IMAGE" bash -c '
+                set -e
+                python -c "
+from nemo.collections.llm import import_ckpt
+from nemo.collections.llm.gpt.model.llama import LlamaModel, Llama31Config${SIZE^^}
+cfg = Llama31Config${SIZE^^}()
+model = LlamaModel(config=cfg)
+import_ckpt(model=model, source=\"hf:///src\", output_path=\"/dst\")
+"'
+        ;;
+    llama2_70b_lora)
+        docker run --rm --gpus all --ipc=host --shm-size=16g \
+            -v "$CKPT_DIR/hf_ckpt:/src:ro" \
+            -v "$CKPT_DIR/ckpt/$WL:/dst" \
+            "$IMAGE" bash -c 'cd /workspace/ft-llm && python scripts/convert_model.py --output_path /dst --source /src'
+        ;;
+    *)
+        echo "stage_checkpoint: no conversion defined for $WL" >&2
+        exit 1 ;;
+esac
 
 echo "[3/3] Layout OK under $CKPT_DIR/ckpt/$WL"
 ls -la "$CKPT_DIR/ckpt/$WL" 2>/dev/null || echo "(empty — conversion may require manual review)"
