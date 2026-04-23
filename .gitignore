@@ -26,3 +26,4 @@ Thumbs.db
 __pycache__/
 *.pyc
 .pytest_cache/
+docs/DOCKER_HUB_DESCRIPTION.md
