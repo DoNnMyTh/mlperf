@@ -28,14 +28,20 @@ is required for a first run.
 
 | Workload | Image tag | Size (compressed) | Arch coverage |
 |----------|-----------|:-----------------:|---------------|
-| `llama31_8b` | [`donnmyth/mlperf-nvidia:llama31_8b-pyt-blackwell`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | `sm_100;sm_103` (B200 / GB200 / GB300) |
-| `llama31_8b` | [`donnmyth/mlperf-nvidia:llama31_8b-pyt-sm89`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | + `sm_89` (RTX 40xx / L4 / L40 Ada) |
-| `llama31_405b` | [`donnmyth/mlperf-nvidia:llama31_405b-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default |
-| `llama2_70b_lora` | [`donnmyth/mlperf-nvidia:llama2_70b_lora-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default |
-| `flux1` | [`donnmyth/mlperf-nvidia:flux1-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default |
-| `retinanet` | [`donnmyth/mlperf-nvidia:single_stage_detector-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~14 GB | upstream default |
-| `rgat` | [`donnmyth/mlperf-nvidia:graph_neural_network-dgl`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~13 GB | upstream default |
-| `dlrm_dcnv2` | [`donnmyth/mlperf-nvidia:recommendation-hugectr`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default + mpi4py build fix |
+| `llama31_8b` | `llama31_8b-pyt-blackwell` | ~12 GB | `sm_100;sm_103` (B200 / GB200 / GB300) |
+| `llama31_8b` | `llama31_8b-pyt-sm89` | ~12 GB | + `sm_89` (RTX 40xx / L4 / L40 Ada) |
+| `llama31_8b` | `llama31_8b-pyt-sm90` | ~12 GB | + `sm_90` (H100 / H200 Hopper) |
+| `llama31_405b` | `llama31_405b-pyt` | ~12 GB | upstream default (sm_100/103) |
+| `llama31_405b` | `llama31_405b-pyt-sm90` | ~12 GB | + `sm_90` (H100 / H200) |
+| `llama2_70b_lora` | `llama2_70b_lora-pyt` | ~12 GB | upstream default |
+| `llama2_70b_lora` | `llama2_70b_lora-pyt-sm90` | ~12 GB | + `sm_90` |
+| `flux1` | `flux1-pyt` | ~12 GB | upstream default |
+| `flux1` | `flux1-pyt-sm90` | ~12 GB | + `sm_90` |
+| `retinanet` | `single_stage_detector-pyt` | ~14 GB | upstream default |
+| `rgat` | `graph_neural_network-dgl` | ~13 GB | upstream default |
+| `dlrm_dcnv2` | `recommendation-hugectr` | ~12 GB | upstream default + mpi4py build fix |
+
+All tags pullable from [`donnmyth/mlperf-nvidia`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags).
 
 ### Pull any tag directly
 
@@ -52,14 +58,19 @@ docker pull donnmyth/mlperf-nvidia:llama31_8b-pyt-blackwell
 
 ### H100 / H200 (sm_90) users
 
-None of the published tags include `sm_90` kernels. The driver auto-detects
-Hopper at Step 0 and defaults the "Patch Dockerfile" prompt to `y` so the
-locally-rebuilt image adds `89;90;100a;103a` to `NVTE_CUDA_ARCHS`. See
-[`docs/walkthroughs/4xh200_single_node.md`](docs/walkthroughs/4xh200_single_node.md)
-for the full path.
+Pull the `-sm90` variant of any NeMo workload (`llama31_8b`, `llama31_405b`,
+`llama2_70b_lora`, `flux1`) — built with `NVTE_CUDA_ARCHS="89;90;100a;103a"`
+so kernels cover Ada + Hopper + Blackwell.
 
-An `-sm90` variant is not yet published because the build requires a Hopper
-host; contributions welcome.
+```bash
+docker pull donnmyth/mlperf-nvidia:llama31_8b-pyt-sm90
+docker pull donnmyth/mlperf-nvidia:llama31_405b-pyt-sm90
+docker pull donnmyth/mlperf-nvidia:llama2_70b_lora-pyt-sm90
+docker pull donnmyth/mlperf-nvidia:flux1-pyt-sm90
+```
+
+See [`docs/walkthroughs/4xh200_single_node.md`](docs/walkthroughs/4xh200_single_node.md)
+for the full run-through on a 4×H200 NVLink node.
 
 ---
 

@@ -8,7 +8,7 @@ WL_IMPL_SUBDIR="NVIDIA/benchmarks/llama31_8b/implementations/nemo"
 WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="llama31_8b-pyt"
 # Optional published tag variants: <base>-blackwell , <base>-sm89
-WL_IMAGE_TAG_VARIANTS=("blackwell" "sm89")
+WL_IMAGE_TAG_VARIANTS=("blackwell" "sm89" "sm90")
 
 # Dataset
 WL_DATASET_SUBDIR="8b"                 # $DATADIR/$WL_DATASET_SUBDIR is the root
