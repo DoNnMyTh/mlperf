@@ -6,7 +6,7 @@ WL_DISPLAY="Llama 2 70B LoRA fine-tune (NeMo, GovReport)"
 WL_IMPL_SUBDIR="NVIDIA/benchmarks/llama2_70b_lora/implementations/nemo"
 WL_HUB_REPO="donnmyth/mlperf-nvidia"
 WL_IMAGE_TAG_BASE="llama2_70b_lora-pyt"
-WL_IMAGE_TAG_VARIANTS=("")
+WL_IMAGE_TAG_VARIANTS=("" "sm90")
 
 # Dataset layout after preprocessing:
 #   $DATADIR/gov_report/{train.npy, validation.npy}
