@@ -755,6 +755,11 @@ case "$CHOICE" in
                 if (( _ok == 0 )); then
                     warn "Dockerfile NVTE_CUDA_ARCHS='$_df_archs' does not include sm_$AUTO_GPU_ARCH"
                     warn "Kernels WILL fail at runtime on this GPU."
+                    # Auto-yes would silently proceed to a doomed build. Die
+                    # explicitly so the batch/CI path surfaces the problem.
+                    if (( MLPERF_AUTO_YES == 1 )); then
+                        die "Auto-yes + sm mismatch: refuse to proceed. Re-run interactively and accept the arch patch, or set WL_DOCKERFILE_PATCH_TO in the manifest."
+                    fi
                     yesno "Continue with this configuration anyway?" n || die "Aborted. Re-run and accept the patch prompt."
                 fi
                 unset _df_archs _ok _a _a_num
@@ -1184,7 +1189,7 @@ validate_path "$LOGDIR_PARENT" "LOGDIR"
 [[ -d "$LOGDIR_PARENT" ]] || { mkdir -p "$LOGDIR_PARENT" || die "Cannot create $LOGDIR_PARENT"; info "Created $LOGDIR_PARENT"; }
 # Always timestamp so multiple runs never clobber each other. Deferred
 # mkdir until right before launch so aborted prereq checks don't litter.
-LOGDIR="$LOGDIR_PARENT/$(date +%Y%m%d_%H%M%S)"
+LOGDIR="$LOGDIR_PARENT/$(date +%Y%m%d_%H%M%S)_$$"
 info "LOGDIR will be: $LOGDIR (created at launch)"
 export LOGDIR LOGDIR_PARENT
 
@@ -1624,7 +1629,10 @@ case "$METHOD" in
         if type mon_start >/dev/null 2>&1; then
             mkdir -p "$LOGDIR"
             mon_start "$LOGDIR" "$$" "$_MON_BASELINE" || true
-            trap 'type mon_stop >/dev/null 2>&1 && mon_stop "$LOGDIR"' EXIT
+            # Compose with the existing cleanup trap (line 142). Setting a
+            # new trap replaces the previous one in bash, so we must call
+            # both cleanup (container kill) and mon_stop here.
+            trap 'cleanup; type mon_stop >/dev/null 2>&1 && mon_stop "$LOGDIR"' EXIT
         fi
         ;;
 esac
@@ -1635,6 +1643,8 @@ case "$METHOD" in
         exit 0
         ;;
     sbatch)
+        [[ -n "$CONT_REF" ]] \
+            || die "sbatch needs a container ref (CONT_REF). Re-run Step 2 and provide a pyxis-style ref (docker://... or /path/to/image.sqsh)."
         ACCOUNT="$(ask 'Slurm --account (blank to skip)' "${AUTO_SLURM_ACCOUNT:-}")"
         PARTITION="$(ask 'Slurm --partition (blank to skip)' "${AUTO_SLURM_PARTITION:-}")"
         RESERVATION="$(ask 'Slurm --reservation (blank to skip)' '')"
@@ -1649,6 +1659,8 @@ case "$METHOD" in
             sbatch "${ARGS[@]}" run.sub
         ;;
     srun)
+        [[ -n "$CONT_REF" ]] \
+            || die "srun needs a container ref (CONT_REF). Re-run Step 2 and provide a pyxis-style ref."
         NODES="$(ask 'Nodes (-N)' "$DGXNNODES")"
         NTPN="$(ask 'ntasks-per-node' "$DGXNGPU")"
         GPUS="$(ask 'gpus-per-task' 1)"
