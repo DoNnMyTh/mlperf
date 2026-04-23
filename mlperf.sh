@@ -37,12 +37,18 @@ for _a in "$@"; do
     esac
 done
 # Load previous answers so defaults come from the last successful session.
-# Honored silently unless --resume is passed — either way they populate
-# SAVED_* vars that each Step's ask/ask_req consults first.
-declare -A SAVED=()
-if [[ -f "${MLPERF_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mlperf}/session.env" ]]; then
-    # shellcheck disable=SC1090
-    source "${MLPERF_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mlperf}/session.env" 2>/dev/null || true
+# Only a whitelist of keys is read; ephemeral state (CFG_FILE, METHOD,
+# CONT_REF, IMAGE) is reset each run so the wizard doesn't silently reuse
+# a stale pick.
+_MLPERF_STATE_FILE="${MLPERF_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mlperf}/session.env"
+if [[ -f "$_MLPERF_STATE_FILE" ]]; then
+    while IFS= read -r _line; do
+        case "$_line" in
+            'declare -- REPO_DIR='*|'declare -- DATADIR='*|'declare -- LOGDIR_PREV='*|\
+            'declare -- SEED='*|'declare -- WL_NAME='*)
+                eval "$_line" 2>/dev/null || true ;;
+        esac
+    done < "$_MLPERF_STATE_FILE"
 fi
 # -----------------------------------------------------------------------
 
@@ -1266,13 +1272,21 @@ source_configs() {
     set -u
 }
 
-# Create the actual LOGDIR right before dispatch — prereq failures above
-# now return early without leaving empty timestamped dirs behind.
-mkdir -p "$LOGDIR"
+# --dry-run short-circuits to prepare-only for any launcher. Must fire
+# before mkdir/preflight so exploratory runs leave no side effects.
+if (( MLPERF_DRY_RUN == 1 )); then
+    info "[dry-run] skipping launch; emitting prepare-only summary instead."
+    METHOD=prepare
+fi
 
-# Pre-flight: every mount source must exist, or docker will helpfully
-# create it as root-owned and mask the real data. Catches tokenizer-dir
-# typos before NeMo dies 4 minutes in with a cryptic Hydra error.
+# Run bare prereq check here (pre-dispatch) so its docker-fallback can
+# actually reroute METHOD before the case below picks a branch.
+case "$METHOD" in
+    bare|bare_multi|smoke_bare) bare_prereq_check ;;
+esac
+
+# Pre-flight + LOGDIR mkdir only for paths that actually dispatch. Prepare
+# mode should not touch disk.
 preflight_mounts() {
     local missing=0 _p
     for _p in "$DATADIR/$WL_PREPROC_HOST_SUBPATH"; do
@@ -1285,14 +1299,16 @@ preflight_mounts() {
     (( missing == 0 )) || die "Fix mounts above or run Step 3 download."
 }
 case "$METHOD" in
-    smoke|docker|bare|bare_multi|smoke_bare) preflight_mounts ;;
+    smoke|docker|bare|bare_multi|smoke_bare)
+        preflight_mounts
+        mkdir -p "$LOGDIR"
+        ;;
+    sbatch|sbatch_bare|srun|srun_bare)
+        # Cluster launchers write to $LOGDIR from the compute node — create
+        # it on the submit host so Slurm --output has somewhere to land.
+        mkdir -p "$LOGDIR"
+        ;;
 esac
-
-# --dry-run short-circuits to prepare-only for any launcher.
-if (( MLPERF_DRY_RUN == 1 )); then
-    info "[dry-run] skipping launch; emitting prepare-only summary instead."
-    METHOD=prepare
-fi
 
 case "$METHOD" in
     prepare)
@@ -1326,7 +1342,6 @@ case "$METHOD" in
                  bash "$WL_ENTRY"
         ;;
     sbatch_bare)
-        bare_prereq_check
         ACCOUNT="$(ask 'Slurm --account (blank to skip)' "${AUTO_SLURM_ACCOUNT:-}")"
         PARTITION="$(ask 'Slurm --partition (blank to skip)' "${AUTO_SLURM_PARTITION:-}")"
         WRAP="cd '$IMPL_DIR' && source config_common.sh && [[ -f config_common_cg.sh ]] && source config_common_cg.sh; [[ -f config_common_8b.sh ]] && source config_common_8b.sh; source '$CFG_FILE' && bash $WL_ENTRY"
@@ -1337,7 +1352,6 @@ case "$METHOD" in
             sbatch "${ARGS[@]}" --wrap="$WRAP"
         ;;
     srun_bare)
-        bare_prereq_check
         NODES="$(ask 'Nodes (-N)' "$DGXNNODES")"
         NTPN="$(ask 'ntasks-per-node' "$DGXNGPU")"
         GPUS="$(ask 'gpus-per-task' 1)"
@@ -1363,7 +1377,6 @@ case "$METHOD" in
             "
         ;;
     bare)
-        bare_prereq_check
         bare_env_export
         write_host_env_snapshot
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
@@ -1415,7 +1428,6 @@ PY
             "
         ;;
     smoke_bare)
-        bare_prereq_check
         bare_env_export
         write_host_env_snapshot
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
@@ -1456,7 +1468,6 @@ PY
         )
         ;;
     bare_multi)
-        bare_prereq_check
         [[ -n "$WL_PRETRAIN_PY" ]] || die "bare_multi requires WL_PRETRAIN_PY in manifest."
         NNODES="$(ask 'Total NNODES' "$DGXNNODES")"
         NODE_RANK="$(ask_req 'This NODE_RANK')"
@@ -1485,8 +1496,9 @@ esac
 ec=$?
 if (( ec == 0 )); then
     say "Done. Outputs: $LOGDIR"
-    # Persist answers so next run defaults to what worked this run.
-    LOGDIR_PREV="$LOGDIR"  # timestamped path; defaults should seed parent
+    # Persist answers so next run defaults to what worked this run. Save
+    # LOGDIR_PARENT (user-typed) as LOGDIR_PREV — we re-timestamp every run.
+    LOGDIR_PREV="${LOGDIR_PARENT:-$(dirname "$LOGDIR")}"
     state_save WL_NAME REPO_DIR DATADIR LOGDIR_PREV SEED IMAGE CONT_REF \
                METHOD CFG_FILE 2>/dev/null || true
     # Pointer to the latest successful run for quick `cd`.
