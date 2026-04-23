@@ -163,3 +163,26 @@ PIN_MLPERF_LOGGING="3.1.0"
 PIN_PYXIS_SHA="5fa3c38c73aab30adb9f7a1ff3c37b89d0938a43"   # v0.20.0
 PIN_ENROOT_VERSION="3.5.0"
 PIN_SLURM_PACKAGE_NOTE="distro (override via upstream repo)"
+
+# ----------------------------------------------------------------------
+# flock-based mutual exclusion. Prevents two concurrent driver runs from
+# clobbering DATADIR or a patched Dockerfile.
+#   with_lock <lockfile> <timeout_seconds> cmd [args...]
+# ----------------------------------------------------------------------
+with_lock() {
+    local lockfile="$1" timeout="$2"; shift 2
+    if ! command -v flock >/dev/null 2>&1; then
+        warn "flock unavailable; skipping mutual-exclusion on $lockfile"
+        "$@"
+        return $?
+    fi
+    mkdir -p "$(dirname "$lockfile")"
+    (
+        exec 9>"$lockfile"
+        if ! flock -w "$timeout" 9; then
+            err "Another run holds $lockfile; waited ${timeout}s."
+            return 1
+        fi
+        "$@"
+    )
+}

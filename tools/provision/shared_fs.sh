@@ -12,7 +12,6 @@
 set -u
 set -o pipefail
 
-
 # --- mlperf.sh common-lib hook -----------------------------------------
 _MLPERF_LIB_SOURCED=0
 if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
@@ -29,20 +28,6 @@ if [[ -n "${MLPERF_CONFIG_FILE:-}" && -f "${MLPERF_CONFIG_FILE}" ]]; then
     MLPERF_AUTO_YES=1
 fi
 # -----------------------------------------------------------------------
-
-say()  { printf "\n==> %s\n" "$*"; }
-info() { printf "    %s\n" "$*"; }
-err()  { printf "ERROR: %s\n" "$*" >&2; }
-die()  { err "$*"; exit 1; }
-ask()  { local p="$1" d="${2-}" v; if [[ -n "$d" ]]; then read -r -p "$p [$d]: " v; echo "${v:-$d}"; else read -r -p "$p: " v; echo "$v"; fi; }
-    (( MLPERF_AUTO_YES == 1 )) && { echo "${d-}"; return; }
-ask_req(){ local p="$1" v; while :; do read -r -p "$p: " v; [[ -n "$v" ]] && { echo "$v"; return; }; err "required"; done; }
-    (( MLPERF_AUTO_YES == 1 )) && { err "required value \"$p\" not provided in config"; exit 1; }
-yesno(){ local p="$1" d="${2-y}" v; while :; do read -r -p "$p (y/n) [$d]: " v; v="${v:-$d}"
-    (( MLPERF_AUTO_YES == 1 )) && { [[ "${d-y}" == "y" ]]; return; }
-          case "$v" in [Yy]*) return 0;; [Nn]*) return 1;; esac; done; }
-pick() { local p="$1"; shift; local i=1; for o in "$@"; do printf "  [%d] %s\n" "$i" "$o" >&2; i=$((i+1)); done
-         local v; while :; do read -r -p "$p [1]: " v; v="${v:-1}"; [[ "$v" =~ ^[0-9]+$ ]] && (( v>=1 && v<=$# )) && { echo "$v"; return; }; done; }
 
 [[ $EUID -eq 0 ]] || { command -v sudo >/dev/null || die "Need root or sudo"; SUDO=sudo; }
 : "${SUDO:=}"
