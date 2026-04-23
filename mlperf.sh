@@ -26,6 +26,24 @@ if [[ -n "${MLPERF_CONFIG_FILE:-}" && -f "${MLPERF_CONFIG_FILE}" ]]; then
     source "${MLPERF_CONFIG_FILE}"
     MLPERF_AUTO_YES=1
 fi
+# CLI flag parsing (--dry-run, --resume).
+MLPERF_DRY_RUN=0
+MLPERF_RESUME=0
+for _a in "$@"; do
+    case "$_a" in
+        --dry-run)  MLPERF_DRY_RUN=1 ;;
+        --resume)   MLPERF_RESUME=1 ;;
+        --help|-h)  echo "Usage: bash mlperf.sh [--dry-run] [--resume]"; exit 0 ;;
+    esac
+done
+# Load previous answers so defaults come from the last successful session.
+# Honored silently unless --resume is passed — either way they populate
+# SAVED_* vars that each Step's ask/ask_req consults first.
+declare -A SAVED=()
+if [[ -f "${MLPERF_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mlperf}/session.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${MLPERF_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/mlperf}/session.env" 2>/dev/null || true
+fi
 # -----------------------------------------------------------------------
 
 # ====================================================================
@@ -767,7 +785,7 @@ fi
 # step 3: dataset
 # ====================================================================
 say "Step 3: dataset ($WL_DATASET_SUBDIR, ~${WL_DATASET_SIZE_GB}G)"
-DATADIR="$(ask 'DATADIR host path' "$AUTO_DATADIR")"
+DATADIR="$(ask 'DATADIR host path' "${DATADIR:-$AUTO_DATADIR}")"
 validate_path "$DATADIR" "DATADIR"
 yesno "Create $DATADIR if missing?" y && mkdir -p "$DATADIR"
 export DATADIR
@@ -943,25 +961,41 @@ case "$topo" in
         ;;
 esac
 
+# Rough walltime estimate to training-convergence. Lets users spot "405B
+# on 4 H200 = you'll be here for days" before committing.
+_estimate_walltime() {
+    local wl="$1" world="$2"
+    case "$wl" in
+        llama31_8b)      printf '%s\n' "~$(( 240 / world )) min to 1 epoch; MLPerf target: ~1h on 8×H100" ;;
+        llama31_405b)    printf '%s\n' "~$(( 86400 / world )) min to 1 epoch; only feasible on ≥512 GPUs" ;;
+        llama2_70b_lora) printf '%s\n' "~$(( 120 / world )) min to convergence; MLPerf target: ~30m on 8×H100" ;;
+        flux1)           printf '%s\n' "~$(( 180 / world )) min to convergence" ;;
+        retinanet)       printf '%s\n' "~$(( 60 / world )) min to convergence" ;;
+        rgat)            printf '%s\n' "~$(( 90 / world )) min to convergence" ;;
+        dlrm_dcnv2)      printf '%s\n' "~$(( 45 / world )) min to convergence" ;;
+        *)               printf '%s\n' "(no estimate)" ;;
+    esac
+}
+if (( IS_CUSTOM == 0 )) && [[ -n "$CFG_FILE" ]]; then
+    _est_world="${AUTO_NGPU:-1}"
+    info "Cost estimate: $(_estimate_walltime "$WL_NAME" "$_est_world")"
+fi
+
 # ====================================================================
 # step 5: runtime params
 # ====================================================================
 say "Step 5: runtime parameters"
-LOGDIR="$(ask 'LOGDIR' "$AUTO_LOGDIR")"
-validate_path "$LOGDIR" "LOGDIR"
-yesno "Create $LOGDIR if missing?" y && mkdir -p "$LOGDIR"
-if [[ -d "$LOGDIR" ]] && [[ -n "$(ls -A "$LOGDIR" 2>/dev/null)" ]]; then
-    warn "LOGDIR not empty."
-    if yesno "Use timestamped sub-dir?" y; then
-        LOGDIR="$LOGDIR/$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "$LOGDIR"
-        info "LOGDIR: $LOGDIR"
-    fi
-fi
-export LOGDIR
+LOGDIR_PARENT="$(ask 'LOGDIR' "${LOGDIR_PREV:-$AUTO_LOGDIR}")"
+validate_path "$LOGDIR_PARENT" "LOGDIR"
+yesno "Create $LOGDIR_PARENT if missing?" y && mkdir -p "$LOGDIR_PARENT"
+# Always timestamp so multiple runs never clobber each other. Deferred
+# mkdir until right before launch so aborted prereq checks don't litter.
+LOGDIR="$LOGDIR_PARENT/$(date +%Y%m%d_%H%M%S)"
+info "LOGDIR will be: $LOGDIR (created at launch)"
+export LOGDIR LOGDIR_PARENT
 
 while :; do
-    SEED="$(ask 'SEED (positive integer)' 42)"
+    SEED="$(ask 'SEED (positive integer)' "${SEED:-42}")"
     [[ "$SEED" =~ ^[0-9]+$ ]] && break
     err "SEED must be a non-negative integer."
 done
@@ -1109,10 +1143,26 @@ build_smoke_env_str() {
 
 bare_prereq_check() {
     say "Bare-metal prerequisite check"
-    require_tool python; require_tool torchrun
+    # Fallback hook: if bare prereqs fail but a docker image is cached,
+    # give the user a one-keystroke switch instead of a dead-end die.
+    _bare_fallback() {
+        if [[ -n "${IMAGE:-}" ]] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            warn "Bare-metal prereq: $1"
+            if yesno "Switch to docker smoke using cached $IMAGE?" y; then
+                if [[ "$METHOD" == "smoke_bare" ]]; then METHOD="smoke"
+                elif [[ "$METHOD" == "bare" ]];       then METHOD="docker"
+                fi
+                info "Method switched: $METHOD"
+                return 0
+            fi
+        fi
+        die "$1"
+    }
+    if ! command -v python >/dev/null 2>&1; then _bare_fallback "python not on PATH"; return; fi
+    if ! command -v torchrun >/dev/null 2>&1; then _bare_fallback "torchrun not on PATH"; return; fi
     info "python: $(python --version 2>&1)"
     python -c "import torch; print('torch=%s cuda=%s' % (torch.__version__, torch.cuda.is_available()))" \
-        || die "torch import failed"
+        || { _bare_fallback "torch import failed on host python"; return; }
     # NeMo/Megatron inside the container are pinned to specific torch major.
     # A host torch built against a different CUDA runtime (e.g. host cu130 vs
     # container cu124) silently breaks TransformerEngine at runtime. Warn.
@@ -1143,6 +1193,23 @@ bare_prereq_check() {
             pip install -r "$IMPL_DIR/requirements.txt" || warn "pip install issues"
         fi
     fi
+}
+
+write_host_env_snapshot() {
+    # Bare-metal counterpart of run_and_time.sh's /results/container-env
+    # dump — captures enough to reproduce the run env if it breaks later.
+    {
+        echo "# mlperf.sh host env snapshot — $(date -Iseconds)"
+        echo "host: $(hostname)"
+        echo "uname: $(uname -a)"
+        echo "python: $(command -v python) $(python --version 2>&1)"
+        echo "torchrun: $(command -v torchrun)"
+        echo "cuda_visible_devices: ${CUDA_VISIBLE_DEVICES:-}"
+        echo "--- env ---"
+        env | grep -E '^(CUDA|NCCL|TORCH|MLPERF|OMP|PYTORCH)_' | sort
+        echo "--- nvidia-smi ---"
+        command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi || echo "(no nvidia-smi)"
+    } > "$LOGDIR/host-env.log" 2>&1 || true
 }
 
 bare_env_export() {
@@ -1198,6 +1265,34 @@ source_configs() {
     [[ -n "$CFG_FILE" && -f "$CFG_FILE" ]] && source "$CFG_FILE"
     set -u
 }
+
+# Create the actual LOGDIR right before dispatch — prereq failures above
+# now return early without leaving empty timestamped dirs behind.
+mkdir -p "$LOGDIR"
+
+# Pre-flight: every mount source must exist, or docker will helpfully
+# create it as root-owned and mask the real data. Catches tokenizer-dir
+# typos before NeMo dies 4 minutes in with a cryptic Hydra error.
+preflight_mounts() {
+    local missing=0 _p
+    for _p in "$DATADIR/$WL_PREPROC_HOST_SUBPATH"; do
+        [[ -d "$_p" ]] || { warn "Mount source missing: $_p"; missing=1; }
+    done
+    if [[ -n "$WL_TOKENIZER_HOST_SUBPATH" ]]; then
+        [[ -d "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" ]] \
+            || { warn "Tokenizer missing: $DATADIR/$WL_TOKENIZER_HOST_SUBPATH"; missing=1; }
+    fi
+    (( missing == 0 )) || die "Fix mounts above or run Step 3 download."
+}
+case "$METHOD" in
+    smoke|docker|bare|bare_multi|smoke_bare) preflight_mounts ;;
+esac
+
+# --dry-run short-circuits to prepare-only for any launcher.
+if (( MLPERF_DRY_RUN == 1 )); then
+    info "[dry-run] skipping launch; emitting prepare-only summary instead."
+    METHOD=prepare
+fi
 
 case "$METHOD" in
     prepare)
@@ -1270,6 +1365,7 @@ case "$METHOD" in
     bare)
         bare_prereq_check
         bare_env_export
+        write_host_env_snapshot
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
             ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         (
@@ -1321,6 +1417,7 @@ PY
     smoke_bare)
         bare_prereq_check
         bare_env_export
+        write_host_env_snapshot
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
             ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
         # Bare-metal has no /results mount — run_and_time.sh writes
@@ -1388,6 +1485,12 @@ esac
 ec=$?
 if (( ec == 0 )); then
     say "Done. Outputs: $LOGDIR"
+    # Persist answers so next run defaults to what worked this run.
+    LOGDIR_PREV="$LOGDIR"  # timestamped path; defaults should seed parent
+    state_save WL_NAME REPO_DIR DATADIR LOGDIR_PREV SEED IMAGE CONT_REF \
+               METHOD CFG_FILE 2>/dev/null || true
+    # Pointer to the latest successful run for quick `cd`.
+    ln -sfn "$LOGDIR" "$(dirname "$LOGDIR")/latest" 2>/dev/null || true
     case "$METHOD" in
         sbatch|sbatch_bare)
             info "For closed-division compliance, validate with:"
@@ -1399,6 +1502,27 @@ if (( ec == 0 )); then
             ;;
     esac
 else
-    err "Exit code $ec. See $LOGDIR."
+    err "Exit code $ec."
+    # Post-mortem: look for stderr/output inside LOGDIR before telling the
+    # user "see $LOGDIR" — the log showed empty dirs left behind with no
+    # pointer to what actually went wrong.
+    if [[ -d "$LOGDIR" ]]; then
+        _files=$(find "$LOGDIR" -maxdepth 2 -type f 2>/dev/null | head -5)
+        if [[ -z "$_files" ]]; then
+            warn "LOGDIR $LOGDIR is empty — process died before writing output."
+            warn "Likely cause: prereq/mount/permission issue printed above."
+            # Clean up the empty timestamped dir so results/ doesn't clutter.
+            rmdir "$LOGDIR" 2>/dev/null && info "Removed empty LOGDIR."
+        else
+            info "Last output under $LOGDIR:"
+            for _f in $_files; do info "  $_f"; done
+            # Tail the freshest file — often the only hint of the failure.
+            _latest=$(ls -t $_files 2>/dev/null | head -1)
+            if [[ -n "$_latest" ]]; then
+                warn "Tail of $_latest:"
+                tail -n 20 "$_latest" 2>/dev/null | sed 's/^/    /' >&2
+            fi
+        fi
+    fi
 fi
 exit "$ec"
