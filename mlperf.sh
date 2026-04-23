@@ -440,7 +440,7 @@ autodetect_defaults() {
     AUTO_GPU_ARCH="$(gpu_arch_code)"
     case "$AUTO_GPU_ARCH" in
         89)            AUTO_IMG_VARIANT="sm89"      ;;
-        90)            AUTO_IMG_VARIANT="build-sm90";;  # No published variant; build locally.
+        90)            AUTO_IMG_VARIANT="sm90"      ;;
         100|101|103)   AUTO_IMG_VARIANT="blackwell" ;;
         *)             AUTO_IMG_VARIANT=""          ;;
     esac
@@ -456,9 +456,16 @@ autodetect_defaults() {
     info "gpus      : ${AUTO_NGPU}x @ ${AUTO_GPU_MEM_MIB} MiB"
 
     # -------- Existing locally-cached image --------
+    # Prefer a variant that matches the detected GPU arch; fall back to any
+    # image tagged for this workload.
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        AUTO_LOCAL_IMG="$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-            | grep -E "mlperf-nvidia.*${WL_IMAGE_TAG_BASE:-}" | head -1 || true)"
+        local _all; _all="$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+            | grep -E "mlperf-nvidia.*${WL_IMAGE_TAG_BASE:-}" || true)"
+        AUTO_LOCAL_IMG=""
+        if [[ -n "$AUTO_IMG_VARIANT" ]]; then
+            AUTO_LOCAL_IMG="$(echo "$_all" | grep -E "${WL_IMAGE_TAG_BASE}-${AUTO_IMG_VARIANT}\$" | head -1)"
+        fi
+        [[ -z "$AUTO_LOCAL_IMG" ]] && AUTO_LOCAL_IMG="$(echo "$_all" | head -1)"
         [[ -n "$AUTO_LOCAL_IMG" ]] && info "local image present: $AUTO_LOCAL_IMG"
     fi
 
@@ -549,13 +556,22 @@ BARE_OK=1
 [[ "$PLATFORM" == "windows" ]] && { BARE_OK=0; info "Windows: bare-metal disabled."; }
 
 OPTS=()
-# Offer any already-cached local image first so the user doesn't re-pull.
+# Ordering: [1] = best default. Cached image → matching-variant pull →
+# build-local → other pulls. That way pressing Enter does the right thing
+# on a properly-detected host (no re-pull, no unnecessary build).
 if [[ -n "${AUTO_LOCAL_IMG:-}" ]]; then
     OPTS+=("docker: use cached $AUTO_LOCAL_IMG")
+fi
+if [[ -n "${AUTO_IMG_VARIANT:-}" && -n "$WL_HUB_REPO" ]]; then
+    for variant in "${WL_IMAGE_TAG_VARIANTS[@]:-}"; do
+        [[ "$variant" == "$AUTO_IMG_VARIANT" ]] \
+            && OPTS+=("docker: pull $WL_HUB_REPO:$WL_IMAGE_TAG_BASE-$variant")
+    done
 fi
 OPTS+=("docker: build locally (Dockerfile)")
 for variant in "${WL_IMAGE_TAG_VARIANTS[@]:-}"; do
     [[ -n "$WL_HUB_REPO" ]] || continue
+    [[ "$variant" == "$AUTO_IMG_VARIANT" ]] && continue  # already added above
     if [[ -z "$variant" ]]; then
         OPTS+=("docker: pull $WL_HUB_REPO:$WL_IMAGE_TAG_BASE")
     else
@@ -571,8 +587,8 @@ fi
 _rec=""
 case "$AUTO_IMG_VARIANT" in
     sm89)       _rec="pull sm89 variant for Ada (sm_89)" ;;
+    sm90)       _rec="pull sm90 variant for Hopper (H100/H200)" ;;
     blackwell)  _rec="pull blackwell variant for sm_100/103" ;;
-    build-sm90) _rec="build locally (H100/H200 need sm_90 via Dockerfile patch)" ;;
 esac
 [[ -n "$_rec" ]] && info "Recommendation: $_rec"
 [[ -n "${AUTO_LOCAL_IMG:-}" ]] && info "(Tip: local image already cached — $AUTO_LOCAL_IMG)"
@@ -708,16 +724,14 @@ case "$CHOICE" in
 esac
 
 if [[ -n "$IMAGE" ]]; then
-    # Only prompt for the pyxis ref format if a Slurm launcher is actually
-    # available — otherwise CONT_REF is unused and the prompt is noise.
+    # CONT_REF only matters for sbatch/srun launchers. Skip the question
+    # entirely when neither is available. Default to docker:// which is
+    # what upstream run.sub expects on modern pyxis (≥0.17).
     if command -v sbatch >/dev/null 2>&1 || command -v srun >/dev/null 2>&1; then
-        info "Pyxis container-image format:"
-        info "  A) ${IMAGE//\//+}"
-        info "  B) docker://$IMAGE"
-        fmt=$(pick "Pyxis ref format" "${IMAGE//\//+}" "docker://$IMAGE" "skip (not using pyxis)")
+        fmt=$(pick "Pyxis ref format" "docker://$IMAGE" "${IMAGE//\//+}" "skip (not using pyxis)")
         case "$fmt" in
-            1) CONT_REF="${IMAGE//\//+}" ;;
-            2) CONT_REF="docker://$IMAGE" ;;
+            1) CONT_REF="docker://$IMAGE" ;;
+            2) CONT_REF="${IMAGE//\//+}" ;;
             3) CONT_REF="" ;;
         esac
     else
@@ -815,33 +829,29 @@ if (( DO_DL == 1 )); then
 fi
 
 # ====================================================================
-# step 4: config
+# step 4: topology + config (dynamic)
 # ====================================================================
-say "Step 4: config"
-mapfile -t CONFIGS < <(ls $WL_CONFIG_GLOB 2>/dev/null | grep -Ev "$WL_CONFIG_EXCLUDE_RE" || true)
-(( ${#CONFIGS[@]} > 0 )) || die "No config files matching '$WL_CONFIG_GLOB' in $PWD"
+say "Step 4: topology"
 
-# Dynamic config emitter — builds a config sized to the current host.
-# Shape: 1 node × detected GPUs. Parallelism = largest power-of-2 fitting
-# NGPU (TP first, CP secondary on ≥8 GPUs). Not MLPerf-compliant for new
-# workloads but matches the published *_8b.sh template so run.sub works.
+# Dynamic config emitter. Shape: NNODES × NGPU. Parallelism = largest
+# power-of-2 dividing world size, TP-first then CP. Not MLCommons-compliant
+# — uses MINIBS=1, reduced WARMUP — but shape-matches upstream config_*.sh
+# so run.sub / bash entry both work.
 emit_auto_config() {
-    local ngpu="$1" gpu_mem_mib="$2" gpu_arch="$3" out="$4"
+    local nnodes="$1" ngpu_per_node="$2" gpu_mem_mib="$3" gpu_arch="$4" out="$5"
+    local world=$(( nnodes * ngpu_per_node ))
     local tp=1 pp=1 cp=1
-    # Largest power of 2 ≤ ngpu dividing ngpu.
-    while (( tp * 2 <= ngpu && (ngpu % (tp * 2)) == 0 )); do tp=$((tp * 2)); done
-    # Cap TP at 8 (config_common's sanity on QKV splits); spill into CP.
+    while (( tp * 2 <= world && (world % (tp * 2)) == 0 )); do tp=$((tp * 2)); done
     if (( tp > 8 )); then cp=$(( tp / 8 )); tp=8; fi
-    # FP8 only on sm_89+ (Hopper/Ada/Blackwell).
     local fp8=False fp8_hybrid=False
     case "$gpu_arch" in 89|90|100|103) fp8=True; fp8_hybrid=True ;; esac
-    # FP4 only on Blackwell (sm_100+).
     local fp4=False
     case "$gpu_arch" in 100|103) fp4=True ;; esac
     cat > "$out" <<EOF
 # AUTO-GENERATED by mlperf.sh on $(date -Iseconds)
-# Host: $(hostname)  GPUs: $ngpu × ${gpu_mem_mib} MiB, sm_${gpu_arch}
-# 1 node × $ngpu GPU, TP=$tp PP=$pp CP=$cp.  NOT MLCommons-compliant.
+# Host: $(hostname)  Topology: ${nnodes} node × ${ngpu_per_node} GPU
+# GPU: sm_${gpu_arch}, ${gpu_mem_mib} MiB each
+# Parallelism: TP=$tp PP=$pp CP=$cp (world=$world)  NOT MLCommons-compliant.
 source \$(dirname \${BASH_SOURCE[0]})/config_common.sh
 [[ -f \$(dirname \${BASH_SOURCE[0]})/config_common_cg.sh ]] && \
     source \$(dirname \${BASH_SOURCE[0]})/config_common_cg.sh
@@ -855,7 +865,6 @@ export PIPELINE_MODEL_PARALLEL=$pp
 export CONTEXT_PARALLEL=$cp
 export SEQ_PARALLEL=$( [[ $tp -gt 1 ]] && echo True || echo False )
 export INTERLEAVED_PIPELINE=null
-
 export FP8=$fp8
 export FP8_HYBRID=$fp8_hybrid
 export FP4=$fp4
@@ -864,30 +873,54 @@ export TP_COMM_OVERLAP=False
 export WARMUP_STEPS=2
 export VAL_CHECK_INTERVAL=100
 
-export DGXNNODES=1
-export DGXNGPU=$ngpu
+export DGXNNODES=$nnodes
+export DGXNGPU=$ngpu_per_node
 export DGXSYSTEM=\$(basename \$(readlink -f \${BASH_SOURCE[0]}) | sed 's/^config_//' | sed 's/\.sh\$//')
 export WALLTIME_RUNANDTIME=30
 export WALLTIME=\$((5 + \${NEXP:-1} * (\$WALLTIME_RUNANDTIME + 5)))
 EOF
 }
 
-AUTO_CFG=""
-if (( AUTO_NGPU > 0 )); then
-    AUTO_CFG="$IMPL_DIR/config_AUTO_1x${AUTO_NGPU}_${WL_NAME}.sh"
-    emit_auto_config "$AUTO_NGPU" "${AUTO_GPU_MEM_MIB:-0}" "${AUTO_GPU_ARCH:-0}" "$AUTO_CFG"
-    info "Generated dynamic config: $(basename "$AUTO_CFG")"
-    CONFIGS=("$AUTO_CFG" "${CONFIGS[@]}")
-fi
+# Topology prompt — answer drives config generation.
+topo_opts=()
+(( AUTO_NGPU > 0 )) && topo_opts+=("single-node (auto: ${AUTO_NGPU}×sm_${AUTO_GPU_ARCH} on $(hostname))")
+topo_opts+=("multi-node cluster (you specify nodes × gpus)")
+topo_opts+=("advanced: pick a published upstream config")
+(( WL_SMOKE_SUPPORTED == 1 )) && topo_opts+=("1-GPU custom smoke (NOT compliant)")
 
-labels=("${CONFIGS[@]}")
-(( WL_SMOKE_SUPPORTED == 1 )) && labels+=("custom single-GPU smoke (NOT compliant)")
-sel=$(pick "Pick a config" "${labels[@]}")
-if (( WL_SMOKE_SUPPORTED == 1 )) && (( sel == ${#labels[@]} )); then
-    IS_CUSTOM=1; CFG_FILE=""
-else
-    CFG_FILE="${CONFIGS[$((sel-1))]}"
-fi
+tsel=$(pick "Topology" "${topo_opts[@]}")
+topo="${topo_opts[$((tsel-1))]}"
+info "Selected: $topo"
+
+CFG_FILE=""; IS_CUSTOM=0; AUTO_CFG=""
+
+case "$topo" in
+    "single-node"*)
+        AUTO_CFG="$IMPL_DIR/config_AUTO_1x${AUTO_NGPU}_${WL_NAME}.sh"
+        emit_auto_config 1 "$AUTO_NGPU" "${AUTO_GPU_MEM_MIB:-0}" "${AUTO_GPU_ARCH:-0}" "$AUTO_CFG"
+        CFG_FILE="$AUTO_CFG"
+        info "Generated: $(basename "$AUTO_CFG")  (TP auto-picked from NGPU)"
+        ;;
+    "multi-node"*)
+        nnodes=$(ask 'Total nodes' "${SLURM_JOB_NUM_NODES:-1}")
+        ngpu_per_node=$(ask 'GPUs per node' "${AUTO_NGPU:-8}")
+        [[ "$nnodes" =~ ^[0-9]+$ && "$ngpu_per_node" =~ ^[0-9]+$ ]] \
+            || die "nodes and gpus-per-node must be positive integers."
+        AUTO_CFG="$IMPL_DIR/config_AUTO_${nnodes}x${ngpu_per_node}_${WL_NAME}.sh"
+        emit_auto_config "$nnodes" "$ngpu_per_node" "${AUTO_GPU_MEM_MIB:-0}" "${AUTO_GPU_ARCH:-0}" "$AUTO_CFG"
+        CFG_FILE="$AUTO_CFG"
+        info "Generated: $(basename "$AUTO_CFG")  for $nnodes × $ngpu_per_node GPUs"
+        ;;
+    "advanced"*)
+        mapfile -t CONFIGS < <(ls $WL_CONFIG_GLOB 2>/dev/null | grep -Ev "$WL_CONFIG_EXCLUDE_RE" || true)
+        (( ${#CONFIGS[@]} > 0 )) || die "No upstream config files matching '$WL_CONFIG_GLOB' in $PWD"
+        sel=$(pick "Pick an upstream config" "${CONFIGS[@]}")
+        CFG_FILE="${CONFIGS[$((sel-1))]}"
+        ;;
+    "1-GPU custom smoke"*)
+        IS_CUSTOM=1
+        ;;
+esac
 
 # ====================================================================
 # step 5: runtime params
@@ -969,7 +1002,11 @@ else
     fi
     unset _tp _pp _cp _mp
 fi
-info "Note: WALLTIME = MINUTES for docker/bare; HH:MM:SS for sbatch/srun."
+# Only mention WALLTIME units when a Slurm launcher is in play (different
+# unit convention between docker/bare and sbatch/srun).
+if command -v sbatch >/dev/null 2>&1 || command -v srun >/dev/null 2>&1; then
+    info "Note: WALLTIME = MINUTES for docker/bare; HH:MM:SS for sbatch/srun."
+fi
 
 # ====================================================================
 # step 6: launcher
@@ -1003,8 +1040,12 @@ if (( RUN_ON_LOGIN_NODE == 0 )); then
 fi
 if (( IS_CUSTOM == 1 )); then
     OPTS=(); KEYS=()
-    [[ -n "$IMAGE" && $RUN_ON_LOGIN_NODE -eq 0 ]] && add_opt "docker smoke" "smoke"
-    (( BARE_OK == 1 && RUN_ON_LOGIN_NODE == 0 )) && add_opt "bare-metal smoke" "smoke_bare"
+    [[ -n "$IMAGE" && $RUN_ON_LOGIN_NODE -eq 0 ]] && add_opt "docker smoke (recommended)" "smoke"
+    # Bare smoke needs the full NeMo/Megatron/TE stack on the host python;
+    # without a pre-built venv this means a multi-GB pip install. Offer it
+    # but steer users toward docker smoke which already has everything.
+    (( BARE_OK == 1 && RUN_ON_LOGIN_NODE == 0 )) \
+        && add_opt "bare-metal smoke (requires NeMo+Megatron+TE on host)" "smoke_bare"
 fi
 add_opt "prepare-only (stop here; print commands)" "prepare"
 
