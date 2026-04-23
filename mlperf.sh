@@ -608,7 +608,22 @@ case "$CHOICE" in
         case "$AUTO_GPU_ARCH" in 89|90) _patch_default="y" ;; esac
         if [[ -n "$WL_DOCKERFILE_PATCH_FROM" ]] \
            && yesno "Patch Dockerfile for broader sm coverage ($WL_DOCKERFILE_PATCH_FROM -> $WL_DOCKERFILE_PATCH_TO)?" "$_patch_default"; then
-            if grep -qF "$WL_DOCKERFILE_PATCH_FROM" Dockerfile; then
+            # NVTE arch patches: PATCH_TO is of the form
+            #   NVTE_CUDA_ARCHS="a;b;c"
+            # Use regex replacement on the NVTE_CUDA_ARCHS="..." line so the
+            # patch is idempotent AND works regardless of the current arch
+            # list (prior sm89 patch, upstream default, etc.).
+            if [[ "$WL_DOCKERFILE_PATCH_TO" =~ ^NVTE_CUDA_ARCHS=\"[^\"]*\"$ ]]; then
+                if grep -qE 'NVTE_CUDA_ARCHS="[^"]*"' Dockerfile; then
+                    sed -i -E "s|NVTE_CUDA_ARCHS=\"[^\"]*\"|$WL_DOCKERFILE_PATCH_TO|" Dockerfile
+                    info "Patched (regex) — now: $(grep -oE 'NVTE_CUDA_ARCHS="[^"]*"' Dockerfile | head -1)"
+                else
+                    warn "No NVTE_CUDA_ARCHS line in Dockerfile; nothing to patch."
+                fi
+            # Literal string patch (e.g. the dlrm mpi4py RUN rewrite): needs
+            # an exact FROM match. If the Dockerfile already contains the TO
+            # value, treat as idempotent.
+            elif grep -qF "$WL_DOCKERFILE_PATCH_FROM" Dockerfile; then
                 sed -i "s|$WL_DOCKERFILE_PATCH_FROM|$WL_DOCKERFILE_PATCH_TO|" Dockerfile
                 info "Patched."
             elif grep -qF "$WL_DOCKERFILE_PATCH_TO" Dockerfile; then
