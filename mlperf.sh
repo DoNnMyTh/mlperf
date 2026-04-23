@@ -213,6 +213,12 @@ wait_for_docker() {
 
 docker_pull_with_auth() {
     local img="$1" tmp rc
+    # Fast-path: image already local. Avoids the "Status: Image is up to
+    # date ..." round-trip observed on every rerun.
+    if docker image inspect "$img" >/dev/null 2>&1; then
+        info "Image already local: $img (skipping pull)"
+        return 0
+    fi
     tmp="/tmp/.pull.$$"
     # Run docker pull separately so we can distinguish "pull failed (auth)"
     # from "pull failed (network/404/disk)". pipefail would otherwise hide
@@ -369,12 +375,23 @@ fix_nested_dataset() {
 verify_dataset_md5() {
     local dir="$1"
     command -v md5sum >/dev/null 2>&1 || { warn "md5sum missing; skipping verify."; return; }
-    local f
+    local f total_gb
+    # Give the user a runtime estimate — md5 on a 100 GB file at ~500 MB/s
+    # is ~3.5 min per file, and there are usually several. A silent hang
+    # without this prompt is what makes users ^C.
+    total_gb=$(du -sBG "$dir" 2>/dev/null | awk '{gsub(/G/,"",$1); print $1+0}')
+    if (( total_gb > 10 )); then
+        warn "Dataset at $dir is ${total_gb} GB — md5 will take ~$(( total_gb / 30 + 1 )) min on a fast disk."
+        yesno "Proceed with md5 verify?" n || { info "Skipped md5 verify."; return 0; }
+    fi
     shopt -s nullglob
     for f in "$dir"/*.md5; do
-        info "Checking $(basename "$f")..."
-        ( cd "$dir" && md5sum --check --quiet "$(basename "$f")" ) \
-            && info "  OK" || { err "MD5 mismatch in $f"; return 1; }
+        info "Checking $(basename "$f")... (Ctrl-C to abort safely)"
+        # -q prints only mismatches. Stream the actual md5sum so the user
+        # sees per-file progress rather than a single silent prompt.
+        ( cd "$dir" && md5sum --check "$(basename "$f")" ) \
+            || { err "MD5 mismatch in $f"; shopt -u nullglob; return 1; }
+        info "  OK"
     done
     shopt -u nullglob
 }
@@ -521,26 +538,30 @@ say "Selected: $WL_DISPLAY"
 # step 1: repo
 # ====================================================================
 say "Step 1: repository"
-# Auto-detected default: a pre-existing checkout wins; otherwise clone to
-# $PWD/training_results_v5.1.
-_existing="n"
-[[ -d "$AUTO_REPO_DIR/NVIDIA" ]] && _existing="y"
-if yesno "Already have training_results_v5.1 cloned? (auto: $_existing)" "$_existing"; then
-    REPO_DIR="$(ask 'Path to existing repo' "$AUTO_REPO_DIR")"
-    validate_path "$REPO_DIR" "repo"
-    [[ -d "$REPO_DIR" ]] || die "Path not found: $REPO_DIR"
-else
-    REPO_DIR="$(ask 'Where to clone' "$AUTO_REPO_DIR")"
+# If autodetect found a checkout, accept it with a single confirmation
+# instead of the double prompt the old flow used.
+if [[ -d "$AUTO_REPO_DIR/NVIDIA" ]]; then
+    info "Found existing checkout: $AUTO_REPO_DIR"
+    if yesno "Use this repo?" y; then
+        REPO_DIR="$AUTO_REPO_DIR"
+        validate_path "$REPO_DIR" "repo"
+    else
+        REPO_DIR="$(ask 'Alternative repo path' "$AUTO_REPO_DIR")"
+        validate_path "$REPO_DIR" "repo"
+        [[ -d "$REPO_DIR" ]] || die "Path not found: $REPO_DIR"
+    fi
+elif yesno "Clone mlcommons/training_results_v5.1 into $AUTO_REPO_DIR?" y; then
+    REPO_DIR="$AUTO_REPO_DIR"
     validate_path "$REPO_DIR" "repo"
     if [[ -e "$REPO_DIR" ]]; then
         yesno "$REPO_DIR exists. Reuse?" y || die "Pick a different path."
     else
-        if yesno "Shallow clone (depth=1, faster)?" y; then
-            { declare -f retry >/dev/null 2>&1 && retry git clone --depth 1 "$REPO_URL" "$REPO_DIR"; } || git clone --depth 1 "$REPO_URL" "$REPO_DIR" || die "clone failed"
-        else
-            { declare -f retry >/dev/null 2>&1 && retry git clone "$REPO_URL" "$REPO_DIR"; } || git clone "$REPO_URL" "$REPO_DIR" || die "clone failed"
-        fi
+        require_tool git
+        retry git clone --depth 1 https://github.com/mlcommons/training_results_v5.1.git "$REPO_DIR" \
+            || die "git clone failed."
     fi
+else
+    die "Cannot proceed without a repo."
 fi
 IMPL_DIR="$REPO_DIR/$WL_IMPL_SUBDIR"
 [[ -f "$IMPL_DIR/Dockerfile" ]] || die "Dockerfile missing at $IMPL_DIR"
@@ -769,10 +790,10 @@ dataset_files_ok() {
 
 DO_DL=1
 if dataset_files_ok; then
-    if yesno "Dataset present at $DATADIR/$WL_DATASET_SUBDIR. Skip download?" y; then
-        DO_DL=0
-        yesno "Verify md5 checksums?" n && verify_dataset_md5 "$DATADIR/$WL_DATASET_SUBDIR"
-    fi
+    info "Dataset markers present at $DATADIR/$WL_DATASET_SUBDIR — skipping download."
+    DO_DL=0
+    yesno "Verify md5 checksums? (slow, runs md5sum over the tree)" n \
+        && verify_dataset_md5 "$DATADIR/$WL_DATASET_SUBDIR"
 fi
 
 if (( DO_DL == 1 )); then
@@ -1065,6 +1086,10 @@ docker_common_args=(
     -e RANK=0 -e LOCAL_RANK=0 -e WORLD_SIZE=1 -e LOCAL_WORLD_SIZE=1
     -e MASTER_ADDR=127.0.0.1 -e MASTER_PORT="$DEFAULT_MPORT"
     -e SLURM_JOB_ID=local -e SLURM_PROCID=0 -e SLURM_LOCALID=0
+    # Cuts allocator fragmentation during smoke/reduced-layer runs where
+    # activation footprint jumps step-to-step. Upstream prints this tip
+    # on OOM; setting it pre-emptively avoids the retry cycle.
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 )
 if [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]]; then
     docker_common_args+=(-v "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH:$WL_TOKENIZER_MOUNT:ro")
@@ -1088,6 +1113,15 @@ bare_prereq_check() {
     info "python: $(python --version 2>&1)"
     python -c "import torch; print('torch=%s cuda=%s' % (torch.__version__, torch.cuda.is_available()))" \
         || die "torch import failed"
+    # NeMo/Megatron inside the container are pinned to specific torch major.
+    # A host torch built against a different CUDA runtime (e.g. host cu130 vs
+    # container cu124) silently breaks TransformerEngine at runtime. Warn.
+    local _host_torch; _host_torch=$(python -c "import torch,sys; sys.stdout.write(torch.__version__)" 2>/dev/null || echo "")
+    if [[ -n "$_host_torch" && "$_host_torch" != 2.5* && "$_host_torch" != 2.6* ]]; then
+        warn "Host torch=$_host_torch differs from container torch (upstream uses 2.5.x/2.6.x)."
+        warn "NeMo/Megatron/TE may fail to import. Consider docker smoke instead."
+        yesno "Continue anyway?" n || die "Aborted on torch-version mismatch."
+    fi
     if [[ -f "$IMPL_DIR/requirements.txt" ]]; then
         if yesno "pip install -r $IMPL_DIR/requirements.txt?" n; then
             if [[ -z "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]]; then
