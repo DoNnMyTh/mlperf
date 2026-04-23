@@ -497,16 +497,19 @@ autodetect_defaults() {
     info "gpus      : ${AUTO_NGPU}x @ ${AUTO_GPU_MEM_MIB} MiB"
 
     # -------- Existing locally-cached image --------
-    # Prefer a variant that matches the detected GPU arch; fall back to any
-    # image tagged for this workload.
+    # Runs before workload is selected, so WL_IMAGE_TAG_BASE is empty here
+    # on the first pass. Just list any mlperf-nvidia tag; variant-preferred
+    # match re-runs later from Step 2 where WL_IMAGE_TAG_BASE is known.
+    # Use `--` before patterns starting with '-' so GNU grep doesn't parse
+    # them as flags (caught "-sm90$" mis-read as `-s -m 90$`).
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         local _all; _all="$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-            | grep -E "mlperf-nvidia.*${WL_IMAGE_TAG_BASE:-}" || true)"
+            | grep -E -- 'mlperf-nvidia' || true)"
         AUTO_LOCAL_IMG=""
-        if [[ -n "$AUTO_IMG_VARIANT" ]]; then
-            AUTO_LOCAL_IMG="$(echo "$_all" | grep -E "${WL_IMAGE_TAG_BASE}-${AUTO_IMG_VARIANT}\$" | head -1)"
+        if [[ -n "$AUTO_IMG_VARIANT" && -n "$WL_IMAGE_TAG_BASE" ]]; then
+            AUTO_LOCAL_IMG="$(echo "$_all" | grep -E -- "${WL_IMAGE_TAG_BASE}-${AUTO_IMG_VARIANT}\$" | head -n 1)"
         fi
-        [[ -z "$AUTO_LOCAL_IMG" ]] && AUTO_LOCAL_IMG="$(echo "$_all" | head -1)"
+        [[ -z "$AUTO_LOCAL_IMG" ]] && AUTO_LOCAL_IMG="$(echo "$_all" | head -n 1)"
         [[ -n "$AUTO_LOCAL_IMG" ]] && info "local image present: $AUTO_LOCAL_IMG"
     fi
 
@@ -1137,6 +1140,14 @@ fi
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     docker_common_args+=(-e CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
 fi
+# Mount the picked config file into $WL_CONTAINER_WORKDIR so the in-container
+# `source $CFG_FILE` resolves. Without this the host path is dereferenced
+# inside the container where it does not exist (observed bug).
+CFG_IN_CONTAINER=""
+if [[ -n "$CFG_FILE" && -f "$CFG_FILE" ]]; then
+    CFG_IN_CONTAINER="$WL_CONTAINER_WORKDIR/$(basename "$CFG_FILE")"
+    docker_common_args+=(-v "$CFG_FILE:$CFG_IN_CONTAINER:ro")
+fi
 
 build_smoke_env_str() {
     local s=""
@@ -1371,7 +1382,7 @@ case "$METHOD" in
                 [ -f config_common.sh ]    && source config_common.sh    || true
                 [ -f config_common_cg.sh ] && source config_common_cg.sh || true
                 [ -f config_common_8b.sh ] && source config_common_8b.sh || true
-                source $CFG_FILE
+                source ${CFG_IN_CONTAINER:-$CFG_FILE}
                 export DGXNGPU=$NGPU DGXNNODES=1 BINDCMD=''
                 bash $WL_ENTRY
             "
@@ -1381,11 +1392,16 @@ case "$METHOD" in
         write_host_env_snapshot
         [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]] && \
             ln -sfn "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH" "$IMPL_DIR/$(basename "$WL_TOKENIZER_MOUNT")"
+        # Same /results redirect as smoke_bare — run_and_time.sh writes
+        # container-env-<jobid>.log to /results even on the bare path.
+        PATCHED_ENTRY="$LOGDIR/${WL_ENTRY}.patched"
+        sed -e "s|/results|$LOGDIR|g" "$IMPL_DIR/$WL_ENTRY" > "$PATCHED_ENTRY"
+        chmod +x "$PATCHED_ENTRY"
         (
             cd "$IMPL_DIR" || exit 1
             source_configs
             export DGXNGPU="$NGPU" DGXNNODES=1 BINDCMD=""
-            bash "$WL_ENTRY"
+            bash "$PATCHED_ENTRY"
         )
         ;;
     smoke)
