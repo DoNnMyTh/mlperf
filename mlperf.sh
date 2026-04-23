@@ -799,6 +799,15 @@ fi
 say "Step 3: dataset ($WL_DATASET_SUBDIR, ~${WL_DATASET_SIZE_GB}G)"
 DATADIR="$(ask 'DATADIR host path' "${DATADIR:-$AUTO_DATADIR}")"
 validate_path "$DATADIR" "DATADIR"
+# Normalize: if user (or their shell env) set DATADIR ending in the
+# workload's subdir (e.g. .../mlperf_data/8b for the 8b workload), strip
+# the trailing segment. Otherwise we build .../8b/8b and check fails.
+DATADIR="${DATADIR%/}"
+if [[ "$DATADIR" == */"$WL_DATASET_SUBDIR" ]] && [[ -f "$DATADIR/${WL_DATASET_MARKER_FILES[0]:-}" ]]; then
+    warn "DATADIR ends in /$WL_DATASET_SUBDIR — stripping duplicate segment."
+    DATADIR="${DATADIR%/"$WL_DATASET_SUBDIR"}"
+    info "Normalized DATADIR: $DATADIR"
+fi
 yesno "Create $DATADIR if missing?" y && mkdir -p "$DATADIR"
 export DATADIR
 
