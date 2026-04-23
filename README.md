@@ -34,11 +34,11 @@ is required for a first run.
 | `llama31_8b` | `llama31_8b-pyt-sm89` | ~12 GB | + `sm_89` (RTX 40xx / L4 / L40 Ada) | live |
 | `llama31_8b` | `llama31_8b-pyt-sm90` | ~12 GB | + `sm_90` (H100 / H200 Hopper) | live |
 | `llama31_405b` | `llama31_405b-pyt` | ~12 GB | upstream default (sm_100/103) | live |
-| `llama31_405b` | `llama31_405b-pyt-sm90` | ~12 GB | + `sm_90` (H100 / H200) | building |
+| `llama31_405b` | `llama31_405b-pyt-sm90` | ~12 GB | + `sm_90` (H100 / H200) | live |
 | `llama2_70b_lora` | `llama2_70b_lora-pyt` | ~12 GB | upstream default | live |
-| `llama2_70b_lora` | `llama2_70b_lora-pyt-sm90` | ~12 GB | + `sm_90` | building |
+| `llama2_70b_lora` | `llama2_70b_lora-pyt-sm90` | ~12 GB | + `sm_90` | live |
 | `flux1` | `flux1-pyt` | ~12 GB | upstream default | live |
-| `flux1` | `flux1-pyt-sm90` | ~12 GB | + `sm_90` | building |
+| `flux1` | `flux1-pyt-sm90` | ~12 GB | + `sm_90` | live |
 | `retinanet` | `single_stage_detector-pyt` | ~14 GB | upstream default | live |
 | `rgat` | `graph_neural_network-dgl` | ~13 GB | upstream default | live |
 | `dlrm_dcnv2` | `recommendation-hugectr` | ~12 GB | upstream default + mpi4py build fix | live |
@@ -64,8 +64,8 @@ Pull the `-sm90` variant of any NeMo workload (`llama31_8b`, `llama31_405b`,
 `llama2_70b_lora`, `flux1`) — built with `NVTE_CUDA_ARCHS="89;90;100a;103a"`
 so kernels cover Ada + Hopper + Blackwell.
 
-> `llama31_8b-pyt-sm90` is live. `llama31_405b`, `llama2_70b_lora`, `flux1`
-> sm90 tags are building — track progress or build locally via
+> All four NeMo sm90 tags (`llama31_8b`, `llama31_405b`, `llama2_70b_lora`,
+> `flux1`) are live. Rebuild locally any time via
 > [`tools/build_sm90_variants.sh`](tools/build_sm90_variants.sh).
 
 ```bash
