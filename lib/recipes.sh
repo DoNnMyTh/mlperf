@@ -262,6 +262,16 @@ rec_menu() {
         return 2   # signal: fall through to legacy config-file flow
     fi
     local idx=$((choice-1))
+    # Long-run guard: anything >2 days needs explicit second confirmation.
+    # Accidental [4] Full convergence on a 4-GPU cluster = weeks of compute.
+    if (( MLPERF_AUTO_YES == 0 )) \
+       && awk -v s="${R_ETA[idx]:-0}" 'BEGIN{exit !(s>172800)}'; then
+        err "Selected '${R_NAME[idx]}' ETA=$(_rec_fmt_dur "${R_ETA[idx]}") (> 2 days)."
+        err "This will consume substantial GPU-hours. Type 'YES' (upper-case) to confirm, anything else aborts:"
+        local _conf=""
+        read -r _conf
+        [[ "$_conf" == "YES" ]] || { err "Not confirmed. Aborting recipe selection."; return 1; }
+    fi
     REC_CHOICE_NAME="${R_NAME[idx]}"
     REC_CHOICE_STEPS="${R_STEPS[idx]}"
     REC_CHOICE_GBS="${R_GBS[idx]}"
