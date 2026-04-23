@@ -568,15 +568,10 @@ say "Step 1: repository"
 # If autodetect found a checkout, accept it with a single confirmation
 # instead of the double prompt the old flow used.
 if [[ -d "$AUTO_REPO_DIR/NVIDIA" ]]; then
-    info "Found existing checkout: $AUTO_REPO_DIR"
-    if yesno "Use this repo?" y; then
-        REPO_DIR="$AUTO_REPO_DIR"
-        validate_path "$REPO_DIR" "repo"
-    else
-        REPO_DIR="$(ask 'Alternative repo path' "$AUTO_REPO_DIR")"
-        validate_path "$REPO_DIR" "repo"
-        [[ -d "$REPO_DIR" ]] || die "Path not found: $REPO_DIR"
-    fi
+    # Autodetected clone is the right answer >99% of the time; no prompt.
+    info "Using existing checkout: $AUTO_REPO_DIR"
+    REPO_DIR="$AUTO_REPO_DIR"
+    validate_path "$REPO_DIR" "repo"
 elif yesno "Clone mlcommons/training_results_v5.1 into $AUTO_REPO_DIR?" y; then
     REPO_DIR="$AUTO_REPO_DIR"
     validate_path "$REPO_DIR" "repo"
@@ -799,16 +794,21 @@ fi
 say "Step 3: dataset ($WL_DATASET_SUBDIR, ~${WL_DATASET_SIZE_GB}G)"
 DATADIR="$(ask 'DATADIR host path' "${DATADIR:-$AUTO_DATADIR}")"
 validate_path "$DATADIR" "DATADIR"
-# Normalize: if user (or their shell env) set DATADIR ending in the
-# workload's subdir (e.g. .../mlperf_data/8b for the 8b workload), strip
-# the trailing segment. Otherwise we build .../8b/8b and check fails.
+# Recursive normalize: strip any chain of trailing /$WL_DATASET_SUBDIR
+# segments as long as the parent still has the marker file. Handles
+# .../mlperf_data/8b, .../mlperf_data/8b/8b, .../8b/8b/8b, etc.
 DATADIR="${DATADIR%/}"
-if [[ "$DATADIR" == */"$WL_DATASET_SUBDIR" ]] && [[ -f "$DATADIR/${WL_DATASET_MARKER_FILES[0]:-}" ]]; then
+_marker="${WL_DATASET_MARKER_FILES[0]:-}"
+while [[ "$DATADIR" == */"$WL_DATASET_SUBDIR" ]] \
+      && [[ -n "$_marker" && -f "${DATADIR%/"$WL_DATASET_SUBDIR"}/$WL_DATASET_SUBDIR/$_marker" ]]; do
     warn "DATADIR ends in /$WL_DATASET_SUBDIR — stripping duplicate segment."
     DATADIR="${DATADIR%/"$WL_DATASET_SUBDIR"}"
-    info "Normalized DATADIR: $DATADIR"
-fi
-yesno "Create $DATADIR if missing?" y && mkdir -p "$DATADIR"
+done
+unset _marker
+info "DATADIR (normalized): $DATADIR"
+# No prompt if it already exists. Create silently otherwise — keeps the
+# auto-flow moving without a yes/no on a trivial mkdir.
+[[ -d "$DATADIR" ]] || { mkdir -p "$DATADIR" || die "Cannot create $DATADIR"; info "Created $DATADIR"; }
 export DATADIR
 
 # un-nest if the first marker file indicates duplicate-cleanup nesting
@@ -1008,7 +1008,9 @@ fi
 say "Step 5: runtime parameters"
 LOGDIR_PARENT="$(ask 'LOGDIR' "${LOGDIR_PREV:-$AUTO_LOGDIR}")"
 validate_path "$LOGDIR_PARENT" "LOGDIR"
-yesno "Create $LOGDIR_PARENT if missing?" y && mkdir -p "$LOGDIR_PARENT"
+# Auto-create. A yes/no on mkdir is noise when the user just confirmed
+# the path by pressing Enter.
+[[ -d "$LOGDIR_PARENT" ]] || { mkdir -p "$LOGDIR_PARENT" || die "Cannot create $LOGDIR_PARENT"; info "Created $LOGDIR_PARENT"; }
 # Always timestamp so multiple runs never clobber each other. Deferred
 # mkdir until right before launch so aborted prereq checks don't litter.
 LOGDIR="$LOGDIR_PARENT/$(date +%Y%m%d_%H%M%S)"
@@ -1128,7 +1130,11 @@ add_opt "prepare-only (stop here; print commands)" "prepare"
 (( ${#OPTS[@]} > 0 )) || die "No launch method available."
 sel=$(pick "Choose launcher" "${OPTS[@]}")
 METHOD="${KEYS[$((sel-1))]}"
-yesno "Proceed with '$METHOD'?" y || die "Aborted."
+# Only confirm method when the user actually had a choice. Single-option
+# flows (e.g. only docker available) need no additional yes/no.
+if (( ${#OPTS[@]} > 1 )); then
+    yesno "Proceed with '$METHOD'?" y || die "Aborted."
+fi
 
 DEFAULT_MPORT=$(random_port)
 
