@@ -45,7 +45,6 @@ done
 mkdir -p "$LOGDIR"
 STATUS="$LOGDIR/build_sm90.status"
 : > "$STATUS"
-say(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$STATUS"; }
 
 # Discover every manifest declaring an NVTE_CUDA_ARCHS-style patch.
 declare -a SELECTED=()

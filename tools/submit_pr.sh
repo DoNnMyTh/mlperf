@@ -17,7 +17,6 @@
 set -u
 set -o pipefail
 
-
 # --- mlperf.sh common-lib hook -----------------------------------------
 _MLPERF_LIB_SOURCED=0
 if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
@@ -36,18 +35,6 @@ fi
 # -----------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-say()  { printf "\n==> %s\n" "$*"; }
-info() { printf "    %s\n" "$*"; }
-err()  { printf "ERROR: %s\n" "$*" >&2; }
-die()  { err "$*"; exit 1; }
-ask()  { local p="$1" d="${2-}" v; if [[ -n "$d" ]]; then read -r -p "$p [$d]: " v; echo "${v:-$d}"; else read -r -p "$p: " v; echo "$v"; fi; }
-    (( MLPERF_AUTO_YES == 1 )) && { echo "${d-}"; return; }
-ask_req(){ local p="$1" v; while :; do read -r -p "$p: " v; [[ -n "$v" ]] && { echo "$v"; return; }; err "required"; done; }
-    (( MLPERF_AUTO_YES == 1 )) && { err "required value \"$p\" not provided in config"; exit 1; }
-yesno(){ local p="$1" d="${2-y}" v; while :; do read -r -p "$p (y/n) [$d]: " v; v="${v:-$d}"
-    (( MLPERF_AUTO_YES == 1 )) && { [[ "${d-y}" == "y" ]]; return; }
-          case "$v" in [Yy]*) return 0;; [Nn]*) return 1;; esac; done; }
 
 (( BASH_VERSINFO[0] >= 4 )) || die "Bash >= 4 required"
 [[ -t 0 ]] || die "TTY required"

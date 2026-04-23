@@ -603,6 +603,13 @@ fi
 case "$CHOICE" in
     "docker: build"*)
         IMAGE="$(ask 'Local image name:tag' "mlperf-nvidia:$WL_IMAGE_TAG_BASE")"
+        # Serialize Dockerfile patch + docker build against any concurrent
+        # driver run in the same IMPL_DIR — otherwise two runs can stomp each
+        # other's sed on NVTE_CUDA_ARCHS.
+        (
+            exec 9>"$IMPL_DIR/.mlperf.build.lock"
+            command -v flock >/dev/null 2>&1 \
+                && { flock -w 1800 9 || die "another run holds build lock on $IMPL_DIR"; }
         # Smart default for the patch prompt: if the detected local arch is
         # one the patch is meant for (sm_89 Ada, sm_90 Hopper), default to
         # 'y' so the user does not silently get a Blackwell-only image.
@@ -659,6 +666,7 @@ case "$CHOICE" in
         need_space_gb "$(dirname "$IMPL_DIR")" 80 "build dir"
         yesno "Run 'docker build' now?" y || die "Cannot run without an image."
         docker build -t "$IMAGE" . || die "build failed"
+        ) || exit $?
         unset _patch_default
         ;;
     "docker: pull"*)
@@ -743,6 +751,12 @@ if (( DO_DL == 1 )); then
         info "Please stage data manually at: $DATADIR/$WL_DATASET_SUBDIR/"
         yesno "Continue with possibly missing dataset?" n || die "Aborted."
     elif yesno "Run $WL_DOWNLOAD_SCRIPT now?" n; then
+      # Lock DATADIR so two concurrent runs can't double-download or race
+      # on the same partial dataset tree.
+      (
+        exec 9>"$DATADIR/.mlperf.download.lock"
+        command -v flock >/dev/null 2>&1 \
+            && { flock -w 3600 9 || die "another run holds download lock on $DATADIR"; }
         # Expand single layer of ${VAR} references in the manifest's env
         # strings without invoking `eval` on arbitrary content.
         _expand_env() {
@@ -776,6 +790,7 @@ if (( DO_DL == 1 )); then
         fi
         (( ${#WL_DATASET_MARKER_FILES[@]} > 0 )) && \
             fix_nested_dataset "$DATADIR" "$WL_DATASET_SUBDIR" "${WL_DATASET_MARKER_FILES[0]}"
+      ) || exit $?
     else
         warn "Skipped download."
         yesno "Continue without dataset?" n || die "Aborted."

@@ -15,7 +15,6 @@
 set -u
 set -o pipefail
 
-
 # --- mlperf.sh common-lib hook -----------------------------------------
 _MLPERF_LIB_SOURCED=0
 if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
@@ -49,12 +48,6 @@ PYXIS_SHA="${PYXIS_SHA:-5fa3c38c73aab30adb9f7a1ff3c37b89d0938a43}"
 # upstream Slurm repo before running this script if a specific version is
 # required.
 SLURM_VERSION_NOTE="distro-packaged (see comment above)"
-
-say()  { printf "\n==> %s\n" "$*"; }
-info() { printf "    %s\n" "$*"; }
-warn() { printf "WARN: %s\n" "$*" >&2; }
-err()  { printf "ERROR: %s\n" "$*" >&2; }
-die()  { err "$*"; exit 1; }
 
 [[ $EUID -eq 0 ]] || { command -v sudo >/dev/null || die "Need root or sudo"; SUDO=sudo; }
 : "${SUDO:=}"
