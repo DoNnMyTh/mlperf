@@ -13,10 +13,15 @@ set -o pipefail
 
 # --- mlperf.sh common-lib hook -----------------------------------------
 _MLPERF_LIB_SOURCED=0
-if _LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd -P)/common.sh" && [[ -f "$_LIB" ]]; then
+if _LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd -P)" && [[ -f "$_LIBDIR/common.sh" ]]; then
     # shellcheck source=../lib/common.sh
-    source "$_LIB"
+    source "$_LIBDIR/common.sh"
     _MLPERF_LIB_SOURCED=1
+    # Optional modules — missing file is a no-op so branches without them
+    # still work. Ordering matters: recipes.sh uses calibrate.sh.
+    [[ -f "$_LIBDIR/calibrate.sh" ]] && source "$_LIBDIR/calibrate.sh"
+    [[ -f "$_LIBDIR/recipes.sh"   ]] && source "$_LIBDIR/recipes.sh"
+    [[ -f "$_LIBDIR/monitor.sh"   ]] && source "$_LIBDIR/monitor.sh"
 fi
 # Auto-yes / config-file via env only — no flag parsing here to avoid
 # clobbering per-tool argv handling.
@@ -26,16 +31,38 @@ if [[ -n "${MLPERF_CONFIG_FILE:-}" && -f "${MLPERF_CONFIG_FILE}" ]]; then
     source "${MLPERF_CONFIG_FILE}"
     MLPERF_AUTO_YES=1
 fi
-# CLI flag parsing (--dry-run, --resume).
+# CLI flag parsing (--dry-run, --resume, --calibrate, --cal-list).
 MLPERF_DRY_RUN=0
 MLPERF_RESUME=0
+MLPERF_CALIBRATE=0
+MLPERF_CAL_LIST=0
+MLPERF_NO_MONITOR=0
 for _a in "$@"; do
     case "$_a" in
-        --dry-run)  MLPERF_DRY_RUN=1 ;;
-        --resume)   MLPERF_RESUME=1 ;;
-        --help|-h)  echo "Usage: bash mlperf.sh [--dry-run] [--resume]"; exit 0 ;;
+        --dry-run)    MLPERF_DRY_RUN=1 ;;
+        --resume)     MLPERF_RESUME=1 ;;
+        --calibrate)  MLPERF_CALIBRATE=1 ;;
+        --cal-list)   MLPERF_CAL_LIST=1 ;;
+        --no-monitor) MLPERF_NO_MONITOR=1 ;;
+        --help|-h)
+            cat <<'EOF'
+Usage: bash mlperf.sh [flags]
+  --dry-run     Show plan, don't launch.
+  --resume      Reuse last session answers.
+  --calibrate   Run hardware probe (20-step smoke per TP/CP/FP8 combo)
+                and populate ~/.cache/mlperf/calibration.tsv.
+  --cal-list    Print calibration cache and exit.
+  --no-monitor  Disable live divergence/step-time guard during run.
+EOF
+            exit 0 ;;
     esac
 done
+if (( MLPERF_CAL_LIST == 1 )); then
+    type cal_list >/dev/null 2>&1 || { echo "calibration lib not loaded"; exit 1; }
+    cal_list
+    exit 0
+fi
+(( MLPERF_NO_MONITOR == 1 )) && export MLPERF_MONITOR_ENABLE=0
 # Load previous answers so defaults come from the last successful session.
 # Only a whitelist of keys is read; ephemeral state (CFG_FILE, METHOD,
 # CONT_REF, IMAGE) is reset each run so the wizard doesn't silently reuse
@@ -1021,14 +1048,23 @@ _step_time_lookup() {
     printf '%s\ttable\n' "$per_step"
 }
 
+_step_time_record_unlocked() {
+    local key="$1" per_step="$2"
+    local tmp="$MLPERF_STEP_CACHE.tmp.$$"
+    [[ -f "$MLPERF_STEP_CACHE" ]] && awk -F'\t' -v k="$key" '$1!=k' "$MLPERF_STEP_CACHE" > "$tmp" || : > "$tmp"
+    printf '%s\t%s\t%s\n' "$key" "$per_step" "$(date -Iseconds)" >> "$tmp"
+    mv "$tmp" "$MLPERF_STEP_CACHE"
+}
+
 _step_time_record() {
     local wl="$1" arch="$2" world="$3" per_step="$4"
     mkdir -p "$MLPERF_CACHE_DIR"
     local key="$wl|$arch|$world"
-    local tmp="$MLPERF_STEP_CACHE.tmp"
-    [[ -f "$MLPERF_STEP_CACHE" ]] && awk -F'\t' -v k="$key" '$1!=k' "$MLPERF_STEP_CACHE" > "$tmp" || : > "$tmp"
-    printf '%s\t%s\t%s\n' "$key" "$per_step" "$(date -Iseconds)" >> "$tmp"
-    mv "$tmp" "$MLPERF_STEP_CACHE"
+    if type with_lock >/dev/null 2>&1; then
+        with_lock "$MLPERF_STEP_CACHE.lock" 30 _step_time_record_unlocked "$key" "$per_step"
+    else
+        _step_time_record_unlocked "$key" "$per_step"
+    fi
 }
 
 # Parse train_step_time values from MLlog JSON log lines under $1 and record
@@ -1216,9 +1252,64 @@ else
     unset _tp _pp _cp _mp
 fi
 
+# ----------------------------------------------------------------------
+# Dynamic calibration + recipe menu (new path).
+# Runs when --calibrate was passed OR when the calibration cache already
+# has measurements for this (workload, GPU model, NGPU). Replaces the
+# static step-time table as the authoritative ETA source.
+# ----------------------------------------------------------------------
+REC_CHOICE_NAME=""
+if type cal_inventory_hw >/dev/null 2>&1; then
+    cal_inventory_hw
+    if (( MLPERF_CALIBRATE == 1 )); then
+        mkdir -p "$LOGDIR_PARENT"
+        _cal_log="$LOGDIR_PARENT/calibrate_$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$_cal_log"
+        info "Running calibration probe → $_cal_log"
+        if [[ -n "${IMAGE:-}" && -n "${DATADIR:-}" && -n "${IMPL_DIR:-}" ]]; then
+            cal_probe "$WL_NAME" "$NGPU" "$IMAGE" "$DATADIR" "$_cal_log" \
+                      "$IMPL_DIR" "docker" || warn "Calibration completed with errors."
+        else
+            warn "Calibration needs IMAGE+DATADIR+IMPL_DIR — skipping."
+        fi
+    fi
+    if type rec_menu >/dev/null 2>&1 \
+       && [[ -n "${CAL_GPU_MODEL:-}" ]] \
+       && cal_cache_rows_for "$WL_NAME" "$NGPU" | grep -q .; then
+        say "Dynamic recipes available (from calibration cache)"
+        if rec_menu "$WL_NAME" "$NGPU"; then
+            info "Recipe will override the following values from '$(basename "${CFG_FILE:-none}")':"
+            info "  MAX_STEPS, LR, WARMUP_STEPS, VAL_CHECK_INTERVAL,"
+            info "  TP/PP/CP, MICRO_BATCH_SIZE, MINIBS, FP8, FP8_HYBRID,"
+            info "  SEQ_PARALLEL, GRADIENT_CLIP_VAL."
+            info "All other config vars (optimizer, scheduler, dataset) remain from the config file."
+            rec_export
+            # Flag that a dynamic recipe supplied overrides. Downstream
+            # launchers (docker/sbatch/srun) use REC_EXPORT_VARS to forward
+            # these via -e or env= prefix. IS_CUSTOM stays off so the user
+            # retains access to Slurm launchers for compliant runs.
+            REC_OVERRIDES_APPLIED=1
+            REC_EXPORT_VARS=(MAX_STEPS VAL_CHECK_INTERVAL WARMUP_STEPS LR
+                             TENSOR_MODEL_PARALLEL PIPELINE_MODEL_PARALLEL
+                             CONTEXT_PARALLEL MICRO_BATCH_SIZE MINIBS
+                             FP8 FP8_HYBRID SEQ_PARALLEL GRADIENT_CLIP_VAL)
+            # Mirror to SMOKE_PROMPT_VALUES so the legacy smoke-env codepath
+            # (build_smoke_env_str) also picks them up when method=smoke.
+            for _k in "${REC_EXPORT_VARS[@]}"; do
+                SMOKE_PROMPT_VALUES["$_k"]="${!_k}"
+            done
+            SMOKE_PROMPT_VALUES[DGXNGPU]="$NGPU"
+            EST_TOTAL_S="$REC_CHOICE_ETA_S"
+            EST_VERDICT="dynamic"
+        fi
+    else
+        info "(no calibration data yet — using static estimator. Run with --calibrate to populate.)"
+    fi
+fi
+
 # Now that CFG_FILE (incl. upstream chain-sources) has populated MAX_STEPS
 # etc. for non-smoke, compute the runtime estimate for the user.
-run_runtime_estimate
+[[ -z "${EST_TOTAL_S:-}" ]] && run_runtime_estimate
 
 # Only mention WALLTIME units when a Slurm launcher is in play (different
 # unit convention between docker/bare and sbatch/srun).
@@ -1298,6 +1389,14 @@ fi
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     docker_common_args+=(-e CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
 fi
+# Forward recipe overrides through to the container. Without this, the
+# in-container `source $CFG_FILE` path ignores MAX_STEPS/LR/FP8/... that
+# the dynamic menu computed on the host.
+if (( ${REC_OVERRIDES_APPLIED:-0} == 1 )); then
+    for _k in "${REC_EXPORT_VARS[@]}"; do
+        [[ -n "${!_k:-}" ]] && docker_common_args+=(-e "$_k=${!_k}")
+    done
+fi
 # Mount the picked config file into $WL_CONTAINER_WORKDIR so the in-container
 # `source $CFG_FILE` resolves. Without this the host path is dereferenced
 # inside the container where it does not exist (observed bug).
@@ -1314,6 +1413,18 @@ build_smoke_env_str() {
     local k
     for k in "${!SMOKE_PROMPT_VALUES[@]}"; do s+=" $k=${SMOKE_PROMPT_VALUES[$k]}"; done
     echo "$s"
+}
+
+# Emit sbatch-style comma-separated KEY=VAL list for recipe overrides so
+# the Slurm launchers can pass them via --export=ALL,<list>. Empty when
+# no recipe was selected.
+build_recipe_export_list() {
+    (( ${REC_OVERRIDES_APPLIED:-0} == 1 )) || return 0
+    local list="" _k
+    for _k in "${REC_EXPORT_VARS[@]}"; do
+        [[ -n "${!_k:-}" ]] && list+=",${_k}=${!_k}"
+    done
+    echo "${list#,}"
 }
 
 bare_prereq_check() {
@@ -1499,6 +1610,25 @@ if [[ "$METHOD" != "prepare" ]]; then
     esac
 fi
 
+# Live monitor — starts now, observes $LOGDIR MLlog until parent exits or
+# mon_stop is called. Only active for in-process launchers (docker/bare/
+# smoke); sbatch/srun run on remote nodes where this monitor can't see logs.
+_MON_BASELINE=0
+if type rec_best_probe >/dev/null 2>&1 \
+   && [[ -n "${REC_CHOICE_NAME:-}" && "$REC_CHOICE_NAME" != "custom" ]]; then
+    _probe_line=$(rec_best_probe "$WL_NAME" "$NGPU" "${REC_CHOICE_FP8:-0}") || true
+    [[ -n "$_probe_line" ]] && _MON_BASELINE=$(awk '{print $5}' <<<"$_probe_line")
+fi
+case "$METHOD" in
+    docker|bare|bare_multi|smoke|smoke_bare)
+        if type mon_start >/dev/null 2>&1; then
+            mkdir -p "$LOGDIR"
+            mon_start "$LOGDIR" "$$" "$_MON_BASELINE" || true
+            trap 'type mon_stop >/dev/null 2>&1 && mon_stop "$LOGDIR"' EXIT
+        fi
+        ;;
+esac
+
 case "$METHOD" in
     prepare)
         emit_prepare_summary
@@ -1513,6 +1643,8 @@ case "$METHOD" in
         [[ -n "$ACCOUNT" ]]     && ARGS+=(--account="$ACCOUNT")
         [[ -n "$PARTITION" ]]   && ARGS+=(--partition="$PARTITION")
         [[ -n "$RESERVATION" ]] && ARGS+=(--reservation="$RESERVATION")
+        _rec_export=$(build_recipe_export_list)
+        [[ -n "$_rec_export" ]] && ARGS+=(--export="ALL,$_rec_export")
         CONT="$CONT_REF" DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" NEXP="$NEXP" \
             sbatch "${ARGS[@]}" run.sub
         ;;
@@ -1537,6 +1669,8 @@ case "$METHOD" in
         ARGS=(-N "$DGXNNODES" --ntasks-per-node="$DGXNGPU" --gpus-per-task=1 --time="$WALLTIME")
         [[ -n "$ACCOUNT" ]]   && ARGS+=(--account="$ACCOUNT")
         [[ -n "$PARTITION" ]] && ARGS+=(--partition="$PARTITION")
+        _rec_export=$(build_recipe_export_list)
+        [[ -n "$_rec_export" ]] && ARGS+=(--export="ALL,$_rec_export")
         DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" \
             sbatch "${ARGS[@]}" --wrap="$WRAP"
         ;;
@@ -1688,6 +1822,32 @@ PY
 esac
 
 ec=$?
+# Stop live monitor (no-op if never started) and print alert summary.
+if type mon_stop >/dev/null 2>&1; then
+    mon_stop "$LOGDIR" 2>/dev/null || true
+    type mon_report >/dev/null 2>&1 && mon_report "$LOGDIR" || true
+fi
+# After run, record measured step-time into calibration cache so future
+# ETAs and recipe menus reflect reality on this hardware.
+if type cal_cache_record >/dev/null 2>&1 && [[ -d "$LOGDIR" ]]; then
+    _post_step=$(grep -rh '"train_step_time"' "$LOGDIR" 2>/dev/null \
+               | sed -nE 's/.*"train_step_time"[[:space:]]*:[[:space:]]*([0-9.eE+-]+).*/\1/p' \
+               | awk 'NR>10' | sort -g \
+               | awk '{a[NR]=$1} END{if(NR==0) exit; if(NR%2) print a[(NR+1)/2]; else printf "%.6f\n",(a[NR/2]+a[NR/2+1])/2}')
+    if [[ -n "$_post_step" ]]; then
+        cal_inventory_hw
+        # Normalize by MICRO_BATCH so cache key matches the probe (which
+        # always runs at microbs=1). Step-time scales linearly with
+        # microbs at steady state, so division gives a comparable value.
+        _mbs="${MICRO_BATCH_SIZE:-1}"; (( _mbs < 1 )) && _mbs=1
+        _norm_step=$(awk -v s="$_post_step" -v m="$_mbs" 'BEGIN{printf "%.6f", s/m}')
+        cal_cache_record "$WL_NAME" "$NGPU" \
+            "${TENSOR_MODEL_PARALLEL:-1}" "${PIPELINE_MODEL_PARALLEL:-1}" \
+            "${CONTEXT_PARALLEL:-1}" "$([[ "${FP8:-False}" == "True" ]] && echo 1 || echo 0)" \
+            1 "$_norm_step" 0 0
+        info "Cached measured step-time ${_post_step}s (normalized ${_norm_step}s/microbs=1) → $CAL_CACHE"
+    fi
+fi
 if (( ec == 0 )); then
     say "Done. Outputs: $LOGDIR"
     # Persist answers so next run defaults to what worked this run. Save
