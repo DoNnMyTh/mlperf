@@ -10,7 +10,12 @@
 
 - name: Stage bootstrap_node.sh on remote host
   ansible.builtin.copy:
-    src: "../../bootstrap_node.sh"   # relative to role files/; adjust if running from the repo checkout
+    # `src:` for copy is resolved relative to role's files/ dir. Our
+    # bootstrap_node.sh lives outside the role, so resolve via the
+    # playbook's filesystem using `lookup('file', ...)` — works whether
+    # the playbook is run from the repo checkout or the role is vendored
+    # into another tree.
+    content: "{{ lookup('file', playbook_dir + '/../bootstrap_node.sh') }}"
     dest: /usr/local/sbin/mlperf-bootstrap-node
     owner: root
     group: root
