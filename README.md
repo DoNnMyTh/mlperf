@@ -3,6 +3,7 @@
 [![MLPerf](https://img.shields.io/badge/MLPerf-Training%20v5.1-76B900)](https://mlcommons.org/benchmarks/training/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%2FWSL2-lightgrey)](#supported-platforms)
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-donnmyth%2Fmlperf--nvidia-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/donnmyth/mlperf-nvidia)
 
 A single, self-contained, idempotent Bash driver that guides an operator through the full lifecycle of running any NVIDIA MLPerf Training v5.1 submission — from source checkout through container provisioning, dataset ingestion, configuration selection, and benchmark launch — across heterogeneous target environments (workstations, single-node Docker hosts, and multi-node Slurm clusters). Workloads are contributed as lightweight manifest files; the driver itself stays workload-agnostic.
 
@@ -17,6 +18,48 @@ A single, self-contained, idempotent Bash driver that guides an operator through
 | `retinanet` | Object detection | OpenImages-v6 (MLPerf subset) | `retinanet/implementations/tyche_ngpu8_ngc25.04_pytorch` |
 | `dlrm_dcnv2` | Recommendation | Criteo 1TB | `dlrm_dcnv2/implementations/hugectr` |
 | `rgat` | Graph neural net | IGBH-Full | `rgat/implementations/tyche_ngpu8_ngc25.03_dgl` |
+
+## Published Docker Images
+
+All seven workloads are pre-built and pushed to Docker Hub under
+[`donnmyth/mlperf-nvidia`](https://hub.docker.com/r/donnmyth/mlperf-nvidia).
+The driver's Step 2 picker offers `docker: pull` for each; no local build
+is required for a first run.
+
+| Workload | Image tag | Size (compressed) | Arch coverage |
+|----------|-----------|:-----------------:|---------------|
+| `llama31_8b` | [`donnmyth/mlperf-nvidia:llama31_8b-pyt-blackwell`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | `sm_100;sm_103` (B200 / GB200 / GB300) |
+| `llama31_8b` | [`donnmyth/mlperf-nvidia:llama31_8b-pyt-sm89`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | + `sm_89` (RTX 40xx / L4 / L40 Ada) |
+| `llama31_405b` | [`donnmyth/mlperf-nvidia:llama31_405b-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default |
+| `llama2_70b_lora` | [`donnmyth/mlperf-nvidia:llama2_70b_lora-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default |
+| `flux1` | [`donnmyth/mlperf-nvidia:flux1-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default |
+| `retinanet` | [`donnmyth/mlperf-nvidia:single_stage_detector-pyt`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~14 GB | upstream default |
+| `rgat` | [`donnmyth/mlperf-nvidia:graph_neural_network-dgl`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~13 GB | upstream default |
+| `dlrm_dcnv2` | [`donnmyth/mlperf-nvidia:recommendation-hugectr`](https://hub.docker.com/r/donnmyth/mlperf-nvidia/tags) | ~12 GB | upstream default + mpi4py build fix |
+
+### Pull any tag directly
+
+```bash
+docker pull donnmyth/mlperf-nvidia:llama31_8b-pyt-sm89
+docker pull donnmyth/mlperf-nvidia:llama31_405b-pyt
+docker pull donnmyth/mlperf-nvidia:llama2_70b_lora-pyt
+docker pull donnmyth/mlperf-nvidia:flux1-pyt
+docker pull donnmyth/mlperf-nvidia:single_stage_detector-pyt
+docker pull donnmyth/mlperf-nvidia:graph_neural_network-dgl
+docker pull donnmyth/mlperf-nvidia:recommendation-hugectr
+docker pull donnmyth/mlperf-nvidia:llama31_8b-pyt-blackwell
+```
+
+### H100 / H200 (sm_90) users
+
+None of the published tags include `sm_90` kernels. The driver auto-detects
+Hopper at Step 0 and defaults the "Patch Dockerfile" prompt to `y` so the
+locally-rebuilt image adds `89;90;100a;103a` to `NVTE_CUDA_ARCHS`. See
+[`docs/walkthroughs/4xh200_single_node.md`](docs/walkthroughs/4xh200_single_node.md)
+for the full path.
+
+An `-sm90` variant is not yet published because the build requires a Hopper
+host; contributions welcome.
 
 ---
 
