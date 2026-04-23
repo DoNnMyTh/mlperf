@@ -1589,6 +1589,14 @@ source_configs() {
         [[ -f "$f" ]] && source "$f"
     done
     [[ -n "$CFG_FILE" && -f "$CFG_FILE" ]] && source "$CFG_FILE"
+    # Recipe overrides must win over upstream `export MAX_STEPS=1200000`
+    # etc. in config_common_*.sh. Re-assert here, last.
+    if (( ${REC_OVERRIDES_APPLIED:-0} == 1 )); then
+        local _k
+        for _k in "${REC_EXPORT_VARS[@]}"; do
+            [[ -n "${!_k:-}" ]] && export "$_k=${!_k}"
+        done
+    fi
     set -u
 }
 
@@ -1733,6 +1741,21 @@ case "$METHOD" in
     docker)
         CNAME="mlperf-$WL_NAME-$$-$(date +%s)"
         track_container "$CNAME"
+        # When a recipe is active, write its overrides to a file mounted
+        # into the container, sourced AFTER config_common*.sh / CFG_FILE.
+        # Otherwise upstream `export MAX_STEPS=1200000` clobbers the -e
+        # vars and silently discards the recipe.
+        RECIPE_OVERRIDE_SRC=""
+        if (( ${REC_OVERRIDES_APPLIED:-0} == 1 )); then
+            _rof="$LOGDIR/recipe_overrides.env"
+            : > "$_rof"
+            for _k in "${REC_EXPORT_VARS[@]}"; do
+                [[ -n "${!_k:-}" ]] && printf 'export %s=%q\n' "$_k" "${!_k}" >> "$_rof"
+            done
+            docker_common_args+=(-v "$_rof:/tmp/recipe_overrides.env:ro")
+            RECIPE_OVERRIDE_SRC='source /tmp/recipe_overrides.env'
+            info "Recipe overrides staged at $_rof (sourced last inside container)."
+        fi
         docker run --name "$CNAME" "${docker_common_args[@]}" \
             "$IMAGE" bash -c "
                 set -e
@@ -1742,6 +1765,7 @@ case "$METHOD" in
                 [ -f config_common_8b.sh ] && source config_common_8b.sh || true
                 source ${CFG_IN_CONTAINER:-$CFG_FILE}
                 export DGXNGPU=$NGPU DGXNNODES=1 BINDCMD=''
+                $RECIPE_OVERRIDE_SRC
                 bash $WL_ENTRY
             "
         ;;

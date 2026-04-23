@@ -25,16 +25,46 @@ declare -A _REC_REF_LR=(
     [rgat]=0.001
     [dlrm_dcnv2]=0.005
 )
-# Reference total steps to convergence target.
-declare -A _REC_REF_STEPS=(
-    [llama31_8b]=1200000
-    [llama31_405b]=6500
-    [llama2_70b_lora]=1000
-    [flux1]=80000
-    [retinanet]=30
-    [rgat]=1500
-    [dlrm_dcnv2]=75000
+# Total training tokens needed for MLPerf convergence target. This is a
+# workload-property (set by the benchmark spec), NOT a cluster choice.
+# MAX_STEPS is then derived per-run as tokens / (GBS * seq_len) so scaling
+# GBS (via NGPU/MINIBS) shortens the step count proportionally.
+declare -A _REC_REF_TOKENS=(
+    [llama31_8b]=11324620800000     # 1,200,000 * 1152 * 8192
+    [llama31_405b]=78198336000      # 6,500 * 1536 * 7831 (approx)
+    [llama2_70b_lora]=16384000      # 1000 * 8 * 2048
+    [flux1]=2621440000              # 80,000 * 256 * 128
+    [retinanet]=983040              # 30 * 32,768 images
+    [rgat]=1536000                  # 1500 * 1024
+    [dlrm_dcnv2]=2147975168         # 75000 * 65536 * ~437
 )
+declare -A _REC_SEQ_LEN=(
+    [llama31_8b]=8192
+    [llama31_405b]=7831
+    [llama2_70b_lora]=2048
+    [flux1]=128
+    [retinanet]=32768   # pixels/sample slot
+    [rgat]=1024
+    [dlrm_dcnv2]=437
+)
+# Engineering short-run horizon (not convergence). Cluster-independent —
+# "loss descends cleanly" is ~10% of the full token budget.
+declare -A _REC_SHORT_FRAC=(
+    [llama31_8b]=0.04   [llama31_405b]=0.05  [llama2_70b_lora]=1.0
+    [flux1]=0.1         [retinanet]=0.3      [rgat]=0.2  [dlrm_dcnv2]=0.1
+)
+
+# Derive MAX_STEPS from token budget, GBS, seq length. Cluster scale
+# (NGPU, MINIBS) enters via GBS. Returns integer.
+rec_derive_max_steps() {
+    local wl="$1" gbs="$2" frac="${3:-1.0}"
+    local tokens="${_REC_REF_TOKENS[$wl]:-0}"
+    local seq="${_REC_SEQ_LEN[$wl]:-2048}"
+    awk -v t="$tokens" -v g="$gbs" -v s="$seq" -v f="$frac" 'BEGIN{
+        if (g<=0 || s<=0 || t<=0) { print 0; exit }
+        printf "%d\n", int(t*f/(g*s))
+    }'
+}
 # Per-eval wallclock estimate (seconds).
 declare -A _REC_EVAL_S=(
     [llama31_8b]=70 [llama31_405b]=600 [llama2_70b_lora]=40
@@ -123,8 +153,9 @@ rec_best_probe() {
 rec_menu() {
     local wl="$1" ngpu="$2"
     local ref_gbs="${_REC_REF_GBS[$wl]:-1024}"
-    local ref_steps="${_REC_REF_STEPS[$wl]:-100000}"
     local eval_s="${_REC_EVAL_S[$wl]:-60}"
+    local seq_len="${_REC_SEQ_LEN[$wl]:-2048}"
+    local short_frac="${_REC_SHORT_FRAC[$wl]:-0.1}"
 
     # Best measured combo (BF16).
     local bf16_line fp8_line
@@ -167,34 +198,39 @@ rec_menu() {
          "$shape_steps" "$dp" "0.0001" 50 9999 \
          "$(rec_eta "$wl" "$b_step" "$shape_steps" 9999)" 0 "$b_tp" "$b_pp" "$b_cp"
 
-    # 3. Short convergence — GBS grown via MINIBS to stabilize LR.
+    # 3. Short convergence — pick MINIBS to hit a stable small GBS, derive
+    # everything from cluster. GBS floor 32 (LR-noise), ceiling ref_gbs.
     local sc_minibs=64
     local sc_gbs=$(( sc_minibs * dp ))
-    (( sc_gbs < 32 )) && sc_gbs=32
-    local sc_steps=50000
+    (( sc_gbs < 32 )) && { sc_gbs=32; sc_minibs=$(( 32/dp )); (( sc_minibs<1 )) && sc_minibs=1; }
+    (( sc_gbs > ref_gbs )) && { sc_gbs=$ref_gbs; sc_minibs=$(( ref_gbs/dp )); (( sc_minibs<1 )) && sc_minibs=1; }
+    local sc_steps; sc_steps=$(rec_derive_max_steps "$wl" "$sc_gbs" "$short_frac")
     local sc_lr sc_warm sc_vci
     sc_lr=$(rec_derive_lr "$wl" "$sc_gbs")
     sc_warm=$(rec_derive_warmup "$sc_steps")
     sc_vci=$(rec_derive_vci "$sc_steps" "$b_step" "$eval_s")
     local sc_eff_step; sc_eff_step=$(awk -v s="$b_step" -v m="$sc_minibs" 'BEGIN{printf "%.4f", s*m}')
-    _add "Short convergence"  "GBS=${sc_gbs}, loss<4 target" \
+    _add "Short convergence"  "GBS=${sc_gbs} (${short_frac}x token budget)" \
          "$sc_steps" "$sc_gbs" "$sc_lr" "$sc_warm" "$sc_vci" \
          "$(rec_eta "$wl" "$sc_eff_step" "$sc_steps" "$sc_vci")" 0 "$b_tp" "$b_pp" "$b_cp"
 
-    # 4. Full convergence — reference GBS via MINIBS, full steps.
+    # 4. Full convergence — scale GBS to cluster. MINIBS chosen so
+    # GBS*seq_len*max_steps == token budget. Users with small NGPU get
+    # small GBS + more steps; large NGPU get large GBS + fewer steps.
     local fc_minibs=$(( ref_gbs / dp ))
     (( fc_minibs < 1 )) && fc_minibs=1
     local fc_gbs=$(( fc_minibs * dp ))
-    local fc_lr fc_warm fc_vci
-    fc_lr="${_REC_REF_LR[$wl]:-0.0002}"
-    fc_warm=$(rec_derive_warmup "$ref_steps")
-    fc_vci=$(rec_derive_vci "$ref_steps" "$b_step" "$eval_s")
+    local fc_steps fc_lr fc_warm fc_vci
+    fc_steps=$(rec_derive_max_steps "$wl" "$fc_gbs" "1.0")
+    fc_lr=$(rec_derive_lr "$wl" "$fc_gbs")
+    fc_warm=$(rec_derive_warmup "$fc_steps")
+    fc_vci=$(rec_derive_vci "$fc_steps" "$b_step" "$eval_s")
     local fc_eff_step; fc_eff_step=$(awk -v s="$b_step" -v m="$fc_minibs" 'BEGIN{printf "%.4f", s*m}')
-    _add "Full convergence"   "reference GBS=${fc_gbs}, MLPerf target" \
-         "$ref_steps" "$fc_gbs" "$fc_lr" "$fc_warm" "$fc_vci" \
-         "$(rec_eta "$wl" "$fc_eff_step" "$ref_steps" "$fc_vci")" 0 "$b_tp" "$b_pp" "$b_cp"
+    _add "Full convergence"   "GBS=${fc_gbs}, full token budget (MLPerf target)" \
+         "$fc_steps" "$fc_gbs" "$fc_lr" "$fc_warm" "$fc_vci" \
+         "$(rec_eta "$wl" "$fc_eff_step" "$fc_steps" "$fc_vci")" 0 "$b_tp" "$b_pp" "$b_cp"
 
-    # 5. FP8 throughput (if measured)
+    # 5. FP8 throughput (if measured) — same GBS as short-conv.
     if [[ -n "$fp8_line" ]]; then
         local fp_eff_step; fp_eff_step=$(awk -v s="$f_step" -v m="$sc_minibs" 'BEGIN{printf "%.4f", s*m}')
         _add "FP8 throughput"     "same as short-conv but FP8 (~${f_step}s/step)" \
