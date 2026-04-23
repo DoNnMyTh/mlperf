@@ -982,25 +982,160 @@ case "$topo" in
         ;;
 esac
 
-# Rough walltime estimate to training-convergence. Lets users spot "405B
-# on 4 H200 = you'll be here for days" before committing.
-_estimate_walltime() {
-    local wl="$1" world="$2"
-    case "$wl" in
-        llama31_8b)      printf '%s\n' "~$(( 240 / world )) min to 1 epoch; MLPerf target: ~1h on 8×H100" ;;
-        llama31_405b)    printf '%s\n' "~$(( 86400 / world )) min to 1 epoch; only feasible on ≥512 GPUs" ;;
-        llama2_70b_lora) printf '%s\n' "~$(( 120 / world )) min to convergence; MLPerf target: ~30m on 8×H100" ;;
-        flux1)           printf '%s\n' "~$(( 180 / world )) min to convergence" ;;
-        retinanet)       printf '%s\n' "~$(( 60 / world )) min to convergence" ;;
-        rgat)            printf '%s\n' "~$(( 90 / world )) min to convergence" ;;
-        dlrm_dcnv2)      printf '%s\n' "~$(( 45 / world )) min to convergence" ;;
-        *)               printf '%s\n' "(no estimate)" ;;
-    esac
+# ---------------------------------------------------------------
+# Runtime estimator — table + cache, used pre-launch so the user sees
+# train/eval/total breakdown and a convergence verdict before committing.
+#
+# step_time_table[workload|arch] = seconds per training step at GBS=1 TP=world.
+# Populated from observed runs; update as you gather more data. Cache file
+# records measured values post-run so future estimates become accurate.
+# ---------------------------------------------------------------
+: "${MLPERF_CACHE_DIR:=${XDG_CACHE_HOME:-$HOME/.cache}/mlperf}"
+MLPERF_STEP_CACHE="$MLPERF_CACHE_DIR/step_times.tsv"
+
+declare -A _STEP_TIME_TABLE=(
+    [llama31_8b|89]=0.40   [llama31_8b|90]=0.20   [llama31_8b|100]=0.10  [llama31_8b|103]=0.08
+    [llama31_405b|90]=4.50 [llama31_405b|100]=2.20 [llama31_405b|103]=1.80
+    [llama2_70b_lora|89]=1.20 [llama2_70b_lora|90]=0.60 [llama2_70b_lora|100]=0.30 [llama2_70b_lora|103]=0.25
+    [flux1|89]=0.35        [flux1|90]=0.18        [flux1|100]=0.09       [flux1|103]=0.07
+    [retinanet|89]=0.25    [retinanet|90]=0.12    [retinanet|100]=0.06   [retinanet|103]=0.05
+    [rgat|89]=0.30         [rgat|90]=0.15         [rgat|100]=0.08        [rgat|103]=0.06
+    [dlrm_dcnv2|89]=0.20   [dlrm_dcnv2|90]=0.10   [dlrm_dcnv2|100]=0.05  [dlrm_dcnv2|103]=0.04
+)
+declare -A _EVAL_TIME_TABLE=(
+    [llama31_8b]=70        [llama31_405b]=600     [llama2_70b_lora]=40
+    [flux1]=30             [retinanet]=45         [rgat]=20             [dlrm_dcnv2]=15
+)
+
+_step_time_lookup() {
+    local wl="$1" arch="$2" world="$3" key="$wl|$arch|$world" per_step=""
+    if [[ -f "$MLPERF_STEP_CACHE" ]]; then
+        per_step=$(awk -F'\t' -v k="$key" '$1==k {print $2; exit}' "$MLPERF_STEP_CACHE" 2>/dev/null)
+        [[ -n "$per_step" ]] && { printf '%s\tcached\n' "$per_step"; return; }
+    fi
+    per_step="${_STEP_TIME_TABLE[$wl|$arch]:-}"
+    if [[ -n "$per_step" && "$world" -gt 1 ]]; then
+        per_step=$(awk -v p="$per_step" -v w="$world" 'BEGIN{printf "%.4f", p / (w^0.85)}')
+    fi
+    [[ -z "$per_step" ]] && { printf '\tunknown\n'; return; }
+    printf '%s\ttable\n' "$per_step"
 }
-if (( IS_CUSTOM == 0 )) && [[ -n "$CFG_FILE" ]]; then
-    _est_world="${AUTO_NGPU:-1}"
-    info "Cost estimate: $(_estimate_walltime "$WL_NAME" "$_est_world")"
-fi
+
+_step_time_record() {
+    local wl="$1" arch="$2" world="$3" per_step="$4"
+    mkdir -p "$MLPERF_CACHE_DIR"
+    local key="$wl|$arch|$world"
+    local tmp="$MLPERF_STEP_CACHE.tmp"
+    [[ -f "$MLPERF_STEP_CACHE" ]] && awk -F'\t' -v k="$key" '$1!=k' "$MLPERF_STEP_CACHE" > "$tmp" || : > "$tmp"
+    printf '%s\t%s\t%s\n' "$key" "$per_step" "$(date -Iseconds)" >> "$tmp"
+    mv "$tmp" "$MLPERF_STEP_CACHE"
+}
+
+# Parse train_step_time values from MLlog JSON log lines under $1 and record
+# the median to the step-time cache for future estimates. Skips first 5% of
+# samples (warm-up). No-op if <10 samples found.
+_record_step_time_from_log() {
+    local logdir="$1" wl="$2" arch="$3" world="$4"
+    [[ -d "$logdir" ]] || return
+    local vals median
+    vals=$(grep -rh '"train_step_time"' "$logdir" 2>/dev/null \
+        | sed -nE 's/.*"train_step_time"[[:space:]]*:[[:space:]]*([0-9.eE+-]+).*/\1/p')
+    local n; n=$(printf '%s\n' "$vals" | grep -c .) || true
+    (( n >= 10 )) || return
+    local skip=$(( n / 20 ))   # drop first 5% as warm-up
+    median=$(printf '%s\n' "$vals" | tail -n +$((skip + 1)) | sort -g \
+        | awk '{a[NR]=$1} END{ if(NR==0) exit; if(NR%2) print a[(NR+1)/2]; else printf "%.6f\n",(a[NR/2]+a[NR/2+1])/2 }')
+    [[ -z "$median" ]] && return
+    _step_time_record "$wl" "$arch" "$world" "$median"
+    info "Cached measured step-time: ${median}s/step → $MLPERF_STEP_CACHE"
+}
+
+_fmt_duration() {
+    local s="${1:-0}"
+    s=${s%.*}
+    (( s <= 0 )) && { printf '0m\n'; return; }
+    local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 ))
+    (( h > 0 )) && printf '%dh%02dm\n' "$h" "$m" || printf '%dm\n' "$m"
+}
+
+# Parse MAX_STEPS / VAL_CHECK_INTERVAL from upstream config_common*.sh.
+# Returns: "<max_steps> <val_check_interval>" or "" if unresolved.
+_parse_upstream_steps() {
+    local dir="$1" f ms="" vci=""
+    for f in "$dir/config_common_8b.sh" "$dir/config_common.sh" "$dir/config_common_cg.sh"; do
+        [[ -f "$f" ]] || continue
+        [[ -z "$ms" ]]  && ms=$(grep -E '^(export[[:space:]]+)?MAX_STEPS=' "$f" | tail -1 | sed -E 's/.*MAX_STEPS=([0-9]+).*/\1/')
+        [[ -z "$vci" ]] && vci=$(grep -E '^(export[[:space:]]+)?VAL_CHECK_INTERVAL=' "$f" | tail -1 | sed -E 's/.*VAL_CHECK_INTERVAL=([0-9]+).*/\1/')
+    done
+    printf '%s %s\n' "${ms:-}" "${vci:-}"
+}
+
+# Emit multi-line estimate block. Sets globals EST_TOTAL_S, EST_VERDICT for
+# downstream pre-launch banner.
+_estimate_wall_detailed() {
+    local wl="$1" arch="$2" world="$3" max_steps="$4" vci="$5" gbs="$6" is_auto="$7"
+    local stp_out per_step src
+    stp_out=$(_step_time_lookup "$wl" "$arch" "$world")
+    per_step="${stp_out%%$'\t'*}"
+    src="${stp_out#*$'\t'}"
+    local eval_s="${_EVAL_TIME_TABLE[$wl]:-60}"
+
+    if [[ -z "$per_step" || -z "$max_steps" ]]; then
+        EST_TOTAL_S=0
+        printf '  step-time  : unknown (no table entry for sm_%s)\n' "$arch"
+        printf '  max-steps  : %s   val-interval: %s\n' "${max_steps:-?}" "${vci:-?}"
+        printf '  ETA        : unknown — run anyway to populate cache\n'
+        EST_VERDICT="unknown"
+        return
+    fi
+    local train_s=$(awk -v s="$max_steps" -v p="$per_step" 'BEGIN{printf "%.0f", s*p}')
+    local n_evals=0
+    (( ${vci:-0} > 0 )) && n_evals=$(( max_steps / vci ))
+    local eval_total=$(( n_evals * eval_s ))
+    local total=$(( train_s + eval_total ))
+    EST_TOTAL_S="$total"
+
+    printf '  step-time  : %ss/step (%s, sm_%s, world=%d)\n' "$per_step" "$src" "$arch" "$world"
+    printf '  max-steps  : %d   val-interval: %s (%d evals × %ds)\n' \
+        "$max_steps" "${vci:-?}" "$n_evals" "$eval_s"
+    printf '  ETA        : train %s + eval %s = %s\n' \
+        "$(_fmt_duration "$train_s")" "$(_fmt_duration "$eval_total")" "$(_fmt_duration "$total")"
+
+    # Convergence verdict
+    EST_VERDICT="compliant"
+    local verdict_msg=""
+    if (( is_auto == 1 )); then
+        EST_VERDICT="non-compliant"
+        verdict_msg="AUTO config (MINIBS=1, GBS=$gbs) — shape-test only, will NOT reach convergence target."
+    elif [[ "$wl" == "llama31_405b" && "$world" -lt 512 ]]; then
+        EST_VERDICT="infeasible"
+        verdict_msg="405B needs ≥512 GPUs for compliance; $world GPUs will take days."
+    fi
+    [[ -n "$verdict_msg" ]] && printf '  verdict    : %s\n' "$verdict_msg"
+}
+
+# Estimator defined here; invocation deferred until after CFG_FILE is sourced
+# (it needs MAX_STEPS/VAL_CHECK_INTERVAL/MINIBS/TP etc. from config env).
+EST_TOTAL_S=0; EST_VERDICT="unknown"
+run_runtime_estimate() {
+    (( IS_CUSTOM == 1 )) && { EST_VERDICT="smoke"; return; }
+    [[ -z "${CFG_FILE:-}" ]] && return
+    local world="${NGPU:-${AUTO_NGPU:-1}}"
+    local arch="${AUTO_GPU_ARCH:-90}"
+    local is_auto=0
+    [[ "$(basename "$CFG_FILE")" == config_AUTO_* ]] && is_auto=1
+    local ms="${MAX_STEPS:-}" vci="${VAL_CHECK_INTERVAL:-}"
+    if [[ -z "$ms" || -z "$vci" ]]; then
+        read -r _ms2 _vci2 <<< "$(_parse_upstream_steps "$(dirname "$CFG_FILE")")"
+        [[ -z "$ms" ]]  && ms="$_ms2"
+        [[ -z "$vci" ]] && vci="$_vci2"
+    fi
+    local tp="${TENSOR_MODEL_PARALLEL:-1}" pp="${PIPELINE_MODEL_PARALLEL:-1}" cp="${CONTEXT_PARALLEL:-1}"
+    local gbs=$(( ${MINIBS:-1} * world / (tp * pp * cp) ))
+    (( gbs < 1 )) && gbs=1
+    say "Estimated runtime"
+    _estimate_wall_detailed "$WL_NAME" "$arch" "$world" "$ms" "$vci" "$gbs" "$is_auto"
+}
 
 # ====================================================================
 # step 5: runtime params
@@ -1080,6 +1215,11 @@ else
     fi
     unset _tp _pp _cp _mp
 fi
+
+# Now that CFG_FILE (incl. upstream chain-sources) has populated MAX_STEPS
+# etc. for non-smoke, compute the runtime estimate for the user.
+run_runtime_estimate
+
 # Only mention WALLTIME units when a Slurm launcher is in play (different
 # unit convention between docker/bare and sbatch/srun).
 if command -v sbatch >/dev/null 2>&1 || command -v srun >/dev/null 2>&1; then
@@ -1274,6 +1414,7 @@ config       : ${CFG_FILE:-<custom smoke>}
 GPUs         : ${NGPU:-?} / ${GPU_TOTAL:-?}  (CVD=${CUDA_VISIBLE_DEVICES:-<all>})
 nnodes       : ${DGXNNODES:-1}   gpus/node : ${DGXNGPU:-$NGPU}
 seed         : $SEED   walltime: ${WALLTIME:-?}
+ETA (total)  : $([[ -n "${EST_TOTAL_S:-}" && "${EST_TOTAL_S:-0}" -gt 0 ]] && _fmt_duration "$EST_TOTAL_S" || echo 'unknown')   verdict: ${EST_VERDICT:-unknown}
 =========================================
 
 To launch later:
@@ -1338,6 +1479,25 @@ case "$METHOD" in
         mkdir -p "$LOGDIR"
         ;;
 esac
+
+# Pre-launch confirmation banner. User sees ETA + verdict one more time
+# before real side-effects start. `prepare` skips (it's already summary-only).
+if [[ "$METHOD" != "prepare" ]]; then
+    say "Launch preview"
+    info "workload : $WL_NAME  on ${NGPU:-?}×sm_${AUTO_GPU_ARCH:-?}  method=$METHOD"
+    info "config   : $(basename "${CFG_FILE:-<custom smoke>}")"
+    info "ETA      : $([[ -n "${EST_TOTAL_S:-}" && "${EST_TOTAL_S:-0}" -gt 0 ]] && _fmt_duration "$EST_TOTAL_S" || echo 'unknown')   verdict: ${EST_VERDICT:-unknown}"
+    case "${EST_VERDICT:-}" in
+        non-compliant|infeasible)
+            warn "This run will NOT produce a submittable MLPerf result."
+            yesno "Proceed anyway?" n || die "Aborted by user." ;;
+        unknown)
+            warn "No step-time data for this (workload,arch,world). ETA unavailable; run will populate cache."
+            yesno "Proceed?" y || die "Aborted by user." ;;
+        *)
+            yesno "Proceed with launch?" y || die "Aborted by user." ;;
+    esac
+fi
 
 case "$METHOD" in
     prepare)
@@ -1545,6 +1705,7 @@ if (( ec == 0 )); then
         docker|bare|bare_multi|smoke|smoke_bare)
             info "Run was NOT launched via sbatch run.sub — not MLPerf-compliant."
             info "For a compliant run use the sbatch launcher with --container-image."
+            _record_step_time_from_log "$LOGDIR" "$WL_NAME" "${AUTO_GPU_ARCH:-0}" "${NGPU:-1}"
             ;;
     esac
 else
