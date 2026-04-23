@@ -773,9 +773,11 @@ esac
 
 if [[ -n "$IMAGE" ]]; then
     # CONT_REF only matters for sbatch/srun launchers. Skip the question
-    # entirely when neither is available. Default to docker:// which is
-    # what upstream run.sub expects on modern pyxis (≥0.17).
-    if command -v sbatch >/dev/null 2>&1 || command -v srun >/dev/null 2>&1; then
+    # entirely when neither is available. Also skip when IMAGE is a local
+    # tag (no '/'): pyxis needs a registry reference, and the docker:// /
+    # enroot-style '+' variants both collapse to the same string.
+    if (command -v sbatch >/dev/null 2>&1 || command -v srun >/dev/null 2>&1) \
+       && [[ "$IMAGE" == */* ]]; then
         fmt=$(pick "Pyxis ref format" "docker://$IMAGE" "${IMAGE//\//+}" "skip (not using pyxis)")
         case "$fmt" in
             1) CONT_REF="docker://$IMAGE" ;;
@@ -784,6 +786,7 @@ if [[ -n "$IMAGE" ]]; then
         esac
     else
         CONT_REF=""
+        [[ "$IMAGE" != */* ]] && info "Local image (no registry) — pyxis ref not applicable."
     fi
 elif [[ -n "$SQSH" ]]; then
     CONT_REF="$SQSH"
