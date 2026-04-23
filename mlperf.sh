@@ -1927,6 +1927,21 @@ if (( ec == 0 )); then
                METHOD CFG_FILE 2>/dev/null || true
     # Pointer to the latest successful run for quick `cd`.
     ln -sfn "$LOGDIR" "$(dirname "$LOGDIR")/latest" 2>/dev/null || true
+
+    # Post-preview pointer: if this was Smoke/Shape (tiny step count),
+    # the run only proved the pipeline works. Tell the user how to
+    # kick off a real run now that the calibration cache is warm.
+    if (( MLPERF_AUTO_YES == 0 )) \
+       && [[ "${REC_CHOICE_NAME:-}" == "Smoke" || "${REC_CHOICE_NAME:-}" == "Shape check" ]]; then
+        say "Preview ok. Pipeline proven. To start a real run:"
+        info "  bash \"$0\""
+        info "  # calibration cache already warm — recipe menu appears instantly."
+        info "  # Recommended picks:"
+        info "  #   [3] Short convergence — engineering run, loss descends"
+        info "  #   [4] Full convergence  — MLPerf target (WARN: multi-day on small clusters)"
+        info "  #   [5] FP8 throughput    — benchmark FP8 vs BF16"
+        info "Full-run ETAs were displayed in the recipe menu earlier this session."
+    fi
     case "$METHOD" in
         sbatch|sbatch_bare)
             info "For closed-division compliance, validate with:"
