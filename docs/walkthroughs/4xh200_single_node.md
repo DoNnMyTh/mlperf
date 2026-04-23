@@ -13,24 +13,26 @@ Goal: a reproducible smoke + custom training run.
 | Disk | ≥ 200 GB free on the dataset drive |
 | Network | Outbound to Docker Hub, GitHub, `training.mlcommons-storage.org` |
 
-## Gotcha #1 — no published image covers sm_90
+## Gotcha #1 — pick a tag with sm_90
 
-The two Docker Hub tags ship these kernel archs:
+Docker Hub tags and their kernel archs:
 
 | Tag | `NVTE_CUDA_ARCHS` | H200 works? |
 |-----|-------------------|:-----------:|
 | `…-blackwell` | `100a;103a`      | ✗ |
 | `…-sm89`      | `89;100a;103a`   | ✗ |
+| `…-sm90`      | `89;90;100a;103a` | ✓ |
 
-You must **build locally** with the Dockerfile patch that adds sm_90:
+Pull the `-sm90` variant of your workload:
 
+```bash
+docker pull donnmyth/mlperf-nvidia:llama31_8b-pyt-sm90
 ```
-Step 2: container source
-  → 1  (docker: build locally)
-  → Patch Dockerfile NVTE_CUDA_ARCHS to add 89 (RTX 40xx/Ada)? y
-```
 
-The manifest's `WL_DOCKERFILE_PATCH_TO` now expands to `89;90;100a;103a`, so a single "yes" covers both Ada and Hopper. Build time ≈ 25 min (TE + Apex wheel compile).
+If the `-sm90` tag is not yet published for your workload (see README status
+table), build locally — `tools/build_sm90_variants.sh` patches the Dockerfile
+with `NVTE_CUDA_ARCHS="89;90;100a;103a"`, builds, tags, and pushes. Build
+time ≈ 25 min per workload (TE + Apex wheel compile).
 
 ## Gotcha #2 — no 1-node × 4-GPU *canned* config is published
 

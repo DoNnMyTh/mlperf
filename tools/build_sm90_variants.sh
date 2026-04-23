@@ -22,6 +22,9 @@ export MSYS_NO_PATHCONV=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MLPERF_REPO="${MLPERF_REPO:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
+# shellcheck source=../lib/common.sh
+if [[ -f "$SCRIPT_DIR/../lib/common.sh" ]]; then source "$SCRIPT_DIR/../lib/common.sh"; fi
+
 REPO="${REPO:-}"
 HUB="${HUB:-donnmyth/mlperf-nvidia}"
 LOGDIR="${LOGDIR:-/tmp/mlperf-build-logs}"
