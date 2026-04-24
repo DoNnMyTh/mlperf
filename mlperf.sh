@@ -1216,6 +1216,17 @@ _record_step_time_from_log() {
         if (( n >= 10 )); then picked="$k"; break; fi
     done
     if [[ -z "$picked" ]]; then
+        # Preview runs often log ONLY a summary line at exit (no per-step
+        # JSON). Fall back to parsing `Average train_step_time <N>` from
+        # upstream's plain-text summary so the cache still gets seeded.
+        local avg
+        avg=$(grep -rhE '^[[:space:]]*Average[[:space:]]+(train_)?step_time[[:space:]]+[0-9.eE+-]+' "$logdir" 2>/dev/null \
+              | awk '{print $NF}' | head -1)
+        if [[ -n "$avg" ]]; then
+            _step_time_record "$wl" "$arch" "$world" "$avg"
+            info "Cached measured step-time: ${avg}s/step (from 'Average step_time' summary) → $MLPERF_STEP_CACHE"
+            return
+        fi
         info "No step-time samples matched any key (${keys// /|}); cache unchanged."
         return
     fi
@@ -1870,6 +1881,7 @@ case "$METHOD" in
         ;;
 esac
 
+_RUN_START=$(date +%s)
 case "$METHOD" in
     prepare)
         emit_prepare_summary
@@ -2160,6 +2172,23 @@ if (( ec == 0 )); then
             # exit 0 while loss is NaN — flag explicitly for user.
             if grep -rqE '"reduced_train_loss"[[:space:]]*:[[:space:]]*(NaN|Inf|-Inf)' "$LOGDIR" 2>/dev/null; then
                 warn "Detected NaN/Inf in reduced_train_loss. FP8 amax overflow or LR misconfigured. Loss trace would NOT converge."
+            fi
+            # Preview just proved the topology boots + trains. Offer the
+            # compliance-sized full run without making the user re-walk the
+            # whole flow. Re-exec with MLPERF_RUN_MODE=full and the same
+            # answers auto-replayed via state_save / MLPERF_AUTO_YES.
+            if [[ "${run_mode:-}" == "preview" ]] && (( IS_CUSTOM == 0 )); then
+                echo
+                say "Preview complete"
+                info "Topology booted and trained $(_fmt_duration "$(( $(date +%s) - ${_RUN_START:-$(date +%s)} ))") without OOM."
+                info "Cached step-time enables accurate ETA for the full run."
+                if yesno "Launch FULL compliance run now (MLPERF_RUN_MODE=full, same topology)?" n; then
+                    info "Re-executing driver with MLPERF_RUN_MODE=full + MLPERF_AUTO_YES=1"
+                    export MLPERF_RUN_MODE=full MLPERF_AUTO_YES=1
+                    # Replay the previous answers from state to skip prompts.
+                    exec bash "$SCRIPT_DIR/mlperf.sh"
+                fi
+                info "To launch full later: MLPERF_RUN_MODE=full bash mlperf.sh"
             fi
             ;;
     esac
