@@ -952,13 +952,17 @@ emit_auto_config() {
     local fp4=False
     case "$gpu_arch" in 100|103) fp4=True ;; esac
 
-    # Micro-batch from GPU memory. Empirical: 8B model at bf16 + FP8 needs
-    # ~22 GB per GPU per sample after TP sharding. Scale MBS accordingly,
-    # capped at 4 for stability on preview runs.
+    # Micro-batch from GPU memory. Preview mode holds MBS=1: optimizer is
+    # replicated across TP (distributed-optimizer needs DP>1 to shard), so
+    # per-GPU state for 8B adamW ≈ 128 GiB + CUDA-graph private pool ≈ 96
+    # GiB — MBS>1 OOMs on ≤4×H200. Full mode relies on upstream config for
+    # proper MBS + DP sizing.
     local mbs=1
-    if (( gpu_mem_mib >= 140000 )); then mbs=4      # H200 141GB
-    elif (( gpu_mem_mib >= 80000 )); then mbs=2     # H100 / A100 80GB
-    else mbs=1
+    if [[ "$run_mode" != "preview" ]]; then
+        if (( gpu_mem_mib >= 140000 )); then mbs=4      # H200 141GB
+        elif (( gpu_mem_mib >= 80000 )); then mbs=2     # H100 / A100 80GB
+        else mbs=1
+        fi
     fi
     local minibs=$(( mbs * world ))
 
@@ -975,10 +979,19 @@ emit_auto_config() {
 # GPU: sm_${gpu_arch}, ${gpu_mem_mib} MiB each
 # Parallelism: TP=$tp PP=$pp CP=$cp (world=$world)  NOT MLCommons-compliant.
 source \$(dirname \${BASH_SOURCE[0]})/config_common.sh
-[[ -f \$(dirname \${BASH_SOURCE[0]})/config_common_cg.sh ]] && \
-    source \$(dirname \${BASH_SOURCE[0]})/config_common_cg.sh
+$( [[ "$run_mode" != "preview" ]] && cat <<'CG'
+[[ -f $(dirname ${BASH_SOURCE[0]})/config_common_cg.sh ]] && \
+    source $(dirname ${BASH_SOURCE[0]})/config_common_cg.sh
+CG
+)
 [[ -f \$(dirname \${BASH_SOURCE[0]})/config_common_8b.sh ]] && \
     source \$(dirname \${BASH_SOURCE[0]})/config_common_8b.sh
+
+# Preview mode skips config_common_cg.sh (CUDA-graph private pool ~96 GiB)
+# and exports expandable_segments to reduce fragmentation OOM. Remove for
+# real compliance runs.
+$( [[ "$run_mode" == "preview" ]] && echo 'export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True' )
+$( [[ "$run_mode" == "preview" ]] && echo 'export ENABLE_CUDA_GRAPHS=False' )
 
 export MINIBS=$minibs
 export MICRO_BATCH_SIZE=$mbs
