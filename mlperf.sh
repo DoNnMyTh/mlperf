@@ -515,13 +515,25 @@ autodetect_defaults() {
     info "gpu arch  : sm_${AUTO_GPU_ARCH:-?}  suggested variant: ${AUTO_IMG_VARIANT:-build-locally}"
 
     # -------- GPU count + memory (for dynamic config sizing) --------
-    AUTO_NGPU=0; AUTO_GPU_MEM_MIB=0
+    # Heterogeneous cluster safety: probe ALL GPUs, use MIN memory (#5).
+    # MIG partitions appear as individual rows — detect + warn (#6).
+    AUTO_NGPU=0; AUTO_GPU_MEM_MIB=0; AUTO_GPU_MEM_MAX=0; AUTO_MIG=0
     if command -v nvidia-smi >/dev/null 2>&1; then
         AUTO_NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
-        AUTO_GPU_MEM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+        local _mems; _mems=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+        if [[ -n "$_mems" ]]; then
+            AUTO_GPU_MEM_MIB=$(printf '%s\n' "$_mems" | sort -n | head -1)
+            AUTO_GPU_MEM_MAX=$(printf '%s\n' "$_mems" | sort -n | tail -1)
+        fi
         [[ -z "$AUTO_GPU_MEM_MIB" ]] && AUTO_GPU_MEM_MIB=0
+        # MIG instances show up as GPU rows with "MIG" in the name field.
+        nvidia-smi -L 2>/dev/null | grep -q 'MIG' && AUTO_MIG=1
     fi
-    info "gpus      : ${AUTO_NGPU}x @ ${AUTO_GPU_MEM_MIB} MiB"
+    info "gpus      : ${AUTO_NGPU}x @ ${AUTO_GPU_MEM_MIB} MiB (min)"
+    if (( AUTO_GPU_MEM_MAX > AUTO_GPU_MEM_MIB )); then
+        warn "Heterogeneous GPU memory: min=${AUTO_GPU_MEM_MIB} max=${AUTO_GPU_MEM_MAX} MiB. Config sized for smallest."
+    fi
+    (( AUTO_MIG == 1 )) && warn "MIG partitions detected; training workloads assume whole GPUs. Disable MIG before running."
 
     # -------- Existing locally-cached image --------
     # Runs before workload is selected, so WL_IMAGE_TAG_BASE is empty here
@@ -999,7 +1011,10 @@ export TENSOR_MODEL_PARALLEL=$tp
 export PIPELINE_MODEL_PARALLEL=$pp
 export CONTEXT_PARALLEL=$cp
 export SEQ_PARALLEL=$( [[ $tp -gt 1 ]] && echo True || echo False )
-export INTERLEAVED_PIPELINE=null
+# INTERLEAVED_PIPELINE must be integer 0 when PP==1 (upstream Hydra
+# parses non-empty string as truthy → 'pipeline-model-parallel size
+# should be greater than 1 with interleaved schedule' crash).
+export INTERLEAVED_PIPELINE=0
 export FP8=$fp8
 export FP8_HYBRID=$fp8_hybrid
 export FP4=$fp4
@@ -1012,7 +1027,10 @@ $( [[ -n "$max_steps" ]] && echo "# preview mode: MAX_STEPS capped. Compliance n
 
 export DGXNNODES=$nnodes
 export DGXNGPU=$ngpu_per_node
-export DGXSYSTEM=\$(basename \$(readlink -f \${BASH_SOURCE[0]}) | sed 's/^config_//' | sed 's/\.sh\$//')
+_dgxs=\$(basename \$(readlink -f \${BASH_SOURCE[0]}))
+_dgxs="\${_dgxs#config_}"; _dgxs="\${_dgxs%.sh}"
+export DGXSYSTEM="\$_dgxs"
+unset _dgxs
 export WALLTIME_RUNANDTIME=30
 export WALLTIME=\$((5 + \${NEXP:-1} * (\$WALLTIME_RUNANDTIME + 5)))
 EOF
@@ -1439,8 +1457,29 @@ fi
 
 DEFAULT_MPORT=$(random_port)
 
+# Pin `--gpus` to the exact device count chosen (or CVD list) so host GPU
+# count > NGPU does not cause NCCL world-size mismatch (#26).
+_gpus_spec="all"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    _gpus_spec="\"device=${CUDA_VISIBLE_DEVICES}\""
+elif [[ -n "${NGPU:-}" ]] && (( NGPU > 0 )); then
+    _gpus_spec="$NGPU"
+fi
+
+# shm-size 32g for H200+ TE fused ops (was 16g, tight on large batches).
+# Cap at host-ram/2 later if probe supports.
+_shm_size=32g
+
+# host-network only works on Linux. Docker Desktop (Win/Mac) silently
+# ignores it; torchrun still works via localhost. Drop on non-Linux.
+_net_flag=()
+if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+    _net_flag=(--network=host)
+fi
+
 docker_common_args=(
-    --rm --gpus all --ipc=host --shm-size=16g --network=host
+    --rm --gpus "$_gpus_spec" --ipc=host --shm-size="$_shm_size"
+    "${_net_flag[@]}"
     --ulimit memlock=-1 --ulimit stack=67108864
     -v "$DATADIR/$WL_PREPROC_HOST_SUBPATH:$WL_PREPROC_MOUNT:ro"
     -v "$LOGDIR:/results"
@@ -1448,6 +1487,9 @@ docker_common_args=(
     -e RANK=0 -e LOCAL_RANK=0 -e WORLD_SIZE=1 -e LOCAL_WORLD_SIZE=1
     -e MASTER_ADDR=127.0.0.1 -e MASTER_PORT="$DEFAULT_MPORT"
     -e SLURM_JOB_ID=local -e SLURM_PROCID=0 -e SLURM_LOCALID=0
+    # Unbuffer python stdout so the user sees live training progress
+    # instead of stale output (#33).
+    -e PYTHONUNBUFFERED=1
     # Cuts allocator fragmentation during smoke/reduced-layer runs where
     # activation footprint jumps step-to-step. Upstream prints this tip
     # on OOM; setting it pre-emptively avoids the retry cycle.
@@ -1460,6 +1502,12 @@ fi
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     docker_common_args+=(-e CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
 fi
+# /npy_index is where megatron writes dataset index cache. Ref config
+# expects a writable bind; without it the build goes to container tmpfs
+# (volatile, wastes re-init on every run). Bind to $LOGDIR/npy_index.
+_npy_dir="$LOGDIR/npy_index"
+mkdir -p "$_npy_dir" 2>/dev/null || true
+docker_common_args+=(-v "$_npy_dir:/npy_index:rw")
 # Forward recipe overrides through to the container. Without this, the
 # in-container `source $CFG_FILE` path ignores MAX_STEPS/LR/FP8/... that
 # the dynamic menu computed on the host.
@@ -1660,9 +1708,55 @@ preflight_mounts() {
     fi
     (( missing == 0 )) || die "Fix mounts above or run Step 3 download."
 }
+
+# Docker-path preflight: catches the top three "docker run" crashes before
+# we burn image-pull time — user-not-in-group (#3), nvidia-container-
+# toolkit absent (#4), disk-full in /var/lib/docker (#9).
+preflight_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker CLI not found. Install Docker Engine / Docker Desktop first."
+    if ! docker info >/dev/null 2>&1; then
+        if [[ "$(uname -s 2>/dev/null)" == "Linux" ]] && ! id -nG 2>/dev/null | grep -qw docker; then
+            die "docker info failed and user not in 'docker' group. Run: sudo usermod -aG docker \$USER && newgrp docker"
+        fi
+        die "docker daemon unreachable. Start Docker and retry."
+    fi
+    # nvidia runtime probe. Attempts lightweight container; failure means
+    # nvidia-container-toolkit / runtime missing or misconfigured.
+    if ! docker run --rm --gpus all --entrypoint true nvidia/cuda:12.4.0-base-ubuntu22.04 >/dev/null 2>&1; then
+        warn "Could not run a CUDA container with --gpus. Likely nvidia-container-toolkit missing."
+        warn "Install:  sudo apt-get install -y nvidia-container-toolkit && sudo systemctl restart docker"
+        yesno "Continue anyway (your own image may bundle the runtime)?" n \
+            || die "Aborted on nvidia runtime preflight."
+    fi
+    # Docker storage free-space. Warn below 50 GiB, die below 10 GiB.
+    local docker_root free_kib
+    docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)"
+    if [[ -n "$docker_root" && -d "$docker_root" ]]; then
+        free_kib=$(df -k "$docker_root" 2>/dev/null | awk 'NR==2 {print $4}')
+        if [[ -n "$free_kib" ]]; then
+            local free_gib=$(( free_kib / 1024 / 1024 ))
+            if (( free_gib < 10 )); then
+                die "Docker storage has only ${free_gib} GiB free at $docker_root (need ≥10 for image + run)."
+            elif (( free_gib < 50 )); then
+                warn "Docker storage: ${free_gib} GiB free at $docker_root (tight; 80 GiB recommended)."
+            fi
+        fi
+    fi
+    # Docker Desktop WSL2 memory too low is a common Windows gotcha. Warn
+    # if total host mem < 32 GiB.
+    if [[ "$(uname -s 2>/dev/null)" =~ MINGW|MSYS|CYGWIN ]]; then
+        local host_ram_gib=0
+        if command -v wmic >/dev/null 2>&1; then
+            host_ram_gib=$(wmic ComputerSystem get TotalPhysicalMemory 2>/dev/null | awk 'NR==2 {printf "%d", $1/1024/1024/1024}')
+        fi
+        (( host_ram_gib > 0 && host_ram_gib < 32 )) && \
+            warn "Host RAM ${host_ram_gib} GiB; Docker Desktop/WSL2 may hit OOM before the GPU does."
+    fi
+}
 case "$METHOD" in
     smoke|docker|bare|bare_multi|smoke_bare)
         preflight_mounts
+        case "$METHOD" in docker|smoke) preflight_docker ;; esac
         mkdir -p "$LOGDIR"
         ;;
     sbatch|sbatch_bare|srun|srun_bare)
@@ -1999,6 +2093,11 @@ if (( ec == 0 )); then
             info "Run was NOT launched via sbatch run.sub — not MLPerf-compliant."
             info "For a compliant run use the sbatch launcher with --container-image."
             _record_step_time_from_log "$LOGDIR" "$WL_NAME" "${AUTO_GPU_ARCH:-0}" "${NGPU:-1}"
+            # NaN/Inf detector (#28). Training sometimes "succeeds" with
+            # exit 0 while loss is NaN — flag explicitly for user.
+            if grep -rqE '"reduced_train_loss"[[:space:]]*:[[:space:]]*(NaN|Inf|-Inf)' "$LOGDIR" 2>/dev/null; then
+                warn "Detected NaN/Inf in reduced_train_loss. FP8 amax overflow or LR misconfigured. Loss trace would NOT converge."
+            fi
             ;;
     esac
 else
