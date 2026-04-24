@@ -132,10 +132,16 @@ warn() { printf "WARN: %s\n" "$*" >&2; }
 err()  { printf "ERROR: %s\n" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
+declare -a AUTO_CFG_CLEANUP_LIST=()
 cleanup() {
     local c
     for c in "${CLEANUP_CONTAINERS[@]:-}"; do
         [[ -n "$c" ]] && docker kill "$c" >/dev/null 2>&1 || true
+    done
+    # Driver-emitted AUTO configs live in IMPL_DIR with a $$ suffix so
+    # concurrent runs don't clobber; wipe on exit so the tree stays clean.
+    for c in "${AUTO_CFG_CLEANUP_LIST[@]:-}"; do
+        [[ -n "$c" && -f "$c" ]] && rm -f "$c" || true
     done
 }
 trap 'err "Aborted by signal."; cleanup; exit 130' INT TERM
@@ -517,19 +523,40 @@ autodetect_defaults() {
     # -------- GPU count + memory (for dynamic config sizing) --------
     # Heterogeneous cluster safety: probe ALL GPUs, use MIN memory (#5).
     # MIG partitions appear as individual rows — detect + warn (#6).
-    AUTO_NGPU=0; AUTO_GPU_MEM_MIB=0; AUTO_GPU_MEM_MAX=0; AUTO_MIG=0
+    # CUDA_VISIBLE_DEVICES pre-set by user narrows visible GPU set (#7):
+    # trust CVD count as authoritative and warn on mismatch with full
+    # nvidia-smi count.
+    AUTO_NGPU=0; AUTO_GPU_MEM_MIB=0; AUTO_GPU_MEM_MAX=0; AUTO_MIG=0; AUTO_NGPU_PHYSICAL=0
     if command -v nvidia-smi >/dev/null 2>&1; then
-        AUTO_NGPU=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+        AUTO_NGPU_PHYSICAL=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+        AUTO_NGPU="$AUTO_NGPU_PHYSICAL"
         local _mems; _mems=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+        # CVD-filter the memory list so we size for the subset user exposed.
+        if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+            local _cvd="${CUDA_VISIBLE_DEVICES//,/ }" _i=0 _filtered=""
+            local -a _ids=( $_cvd )
+            if (( ${#_ids[@]} > 0 )); then
+                while read -r _line; do
+                    for _id in "${_ids[@]}"; do
+                        [[ "$_id" == "$_i" ]] && _filtered+="$_line"$'\n'
+                    done
+                    _i=$((_i + 1))
+                done <<< "$_mems"
+                _mems="${_filtered%$'\n'}"
+                AUTO_NGPU=${#_ids[@]}
+            fi
+        fi
         if [[ -n "$_mems" ]]; then
             AUTO_GPU_MEM_MIB=$(printf '%s\n' "$_mems" | sort -n | head -1)
             AUTO_GPU_MEM_MAX=$(printf '%s\n' "$_mems" | sort -n | tail -1)
         fi
         [[ -z "$AUTO_GPU_MEM_MIB" ]] && AUTO_GPU_MEM_MIB=0
-        # MIG instances show up as GPU rows with "MIG" in the name field.
         nvidia-smi -L 2>/dev/null | grep -q 'MIG' && AUTO_MIG=1
     fi
     info "gpus      : ${AUTO_NGPU}x @ ${AUTO_GPU_MEM_MIB} MiB (min)"
+    if (( AUTO_NGPU_PHYSICAL > AUTO_NGPU )); then
+        info "note      : CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES limits visible set (physical=${AUTO_NGPU_PHYSICAL})"
+    fi
     if (( AUTO_GPU_MEM_MAX > AUTO_GPU_MEM_MIB )); then
         warn "Heterogeneous GPU memory: min=${AUTO_GPU_MEM_MIB} max=${AUTO_GPU_MEM_MAX} MiB. Config sized for smallest."
     fi
@@ -976,7 +1003,19 @@ emit_auto_config() {
         else mbs=1
         fi
     fi
-    local minibs=$(( mbs * world ))
+    # Honor explicit user override from env — lets operators set a GBS
+    # target without hand-editing the AUTO file (#13).
+    [[ -n "${MLPERF_MBS:-}" ]]    && mbs="$MLPERF_MBS"
+    # MINIBS in upstream scripts = MBS × num_microbatches per DP rank.
+    # Preview keeps it == MBS (1 microbatch/step/DP, smallest footprint).
+    # Full keeps historical MBS × world for shape-parity with old configs.
+    local minibs
+    if [[ "$run_mode" == "preview" ]]; then
+        minibs="$mbs"
+    else
+        minibs=$(( mbs * world ))
+    fi
+    [[ -n "${MLPERF_MINIBS:-}" ]] && minibs="$MLPERF_MINIBS"
 
     # MAX_STEPS: preview caps fast; full defers to upstream compliance steps.
     local max_steps val_check warmup
@@ -1079,7 +1118,11 @@ case "$topo" in
         info "gpus/node    : $ngpu_per_node"
         info "gpu arch     : sm_${AUTO_GPU_ARCH:-?}  mem: ${AUTO_GPU_MEM_MIB:-?} MiB"
         info "run mode     : $run_mode   (MLPERF_RUN_MODE=full for compliance)"
-        AUTO_CFG="$IMPL_DIR/config_AUTO_${nnodes}x${ngpu_per_node}_${run_mode}_${WL_NAME}.sh"
+        # Per-invocation suffix avoids clobber when two drivers emit with
+        # identical topology + mode at the same instant (#16). Cleanup in
+        # EXIT trap; file also read-only mounted so no late writes race.
+        AUTO_CFG="$IMPL_DIR/config_AUTO_${nnodes}x${ngpu_per_node}_${run_mode}_${WL_NAME}_$$.sh"
+        AUTO_CFG_CLEANUP_LIST+=("$AUTO_CFG")
         emit_auto_config "$nnodes" "$ngpu_per_node" "${AUTO_GPU_MEM_MIB:-0}" "${AUTO_GPU_ARCH:-0}" "$AUTO_CFG" "$run_mode"
         CFG_FILE="$AUTO_CFG"
         info "Generated: $(basename "$AUTO_CFG")"
@@ -1145,23 +1188,43 @@ _step_time_record() {
     fi
 }
 
-# Parse train_step_time values from MLlog JSON log lines under $1 and record
-# the median to the step-time cache for future estimates. Skips first 5% of
-# samples (warm-up). No-op if <10 samples found.
+# Per-workload MLlog key preferences. Tries each key until one yields >=10
+# samples. Avoids hard-coding "train_step_time" (#31) — retinanet/rgat
+# use different names. Extend per workload as new ones surface.
+declare -A _STEP_TIME_KEYS=(
+    [llama31_8b]="train_step_time step_time iteration_time"
+    [llama31_405b]="train_step_time step_time iteration_time"
+    [llama2_70b_lora]="train_step_time step_time iteration_time"
+    [flux1]="train_step_time step_time"
+    [retinanet]="step_time iteration_time train_step_time"
+    [rgat]="step_time iteration_time train_step_time"
+    [dlrm_dcnv2]="step_time iteration_time train_step_time"
+)
+
+# Parse step-time values from MLlog JSON log lines under $1 and record
+# the median to the step-time cache for future estimates. Skips first 5%
+# of samples (warm-up). No-op if <10 samples found for any candidate key.
 _record_step_time_from_log() {
     local logdir="$1" wl="$2" arch="$3" world="$4"
     [[ -d "$logdir" ]] || return
-    local vals median
-    vals=$(grep -rh '"train_step_time"' "$logdir" 2>/dev/null \
-        | sed -nE 's/.*"train_step_time"[[:space:]]*:[[:space:]]*([0-9.eE+-]+).*/\1/p')
-    local n; n=$(printf '%s\n' "$vals" | grep -c .) || true
-    (( n >= 10 )) || return
-    local skip=$(( n / 20 ))   # drop first 5% as warm-up
+    local keys="${_STEP_TIME_KEYS[$wl]:-train_step_time step_time}"
+    local k vals n median picked=""
+    for k in $keys; do
+        vals=$(grep -rh "\"$k\"" "$logdir" 2>/dev/null \
+            | sed -nE "s/.*\"$k\"[[:space:]]*:[[:space:]]*([0-9.eE+-]+).*/\1/p")
+        n=$(printf '%s\n' "$vals" | grep -c .) || true
+        if (( n >= 10 )); then picked="$k"; break; fi
+    done
+    if [[ -z "$picked" ]]; then
+        info "No step-time samples matched any key (${keys// /|}); cache unchanged."
+        return
+    fi
+    local skip=$(( n / 20 ))
     median=$(printf '%s\n' "$vals" | tail -n +$((skip + 1)) | sort -g \
         | awk '{a[NR]=$1} END{ if(NR==0) exit; if(NR%2) print a[(NR+1)/2]; else printf "%.6f\n",(a[NR/2]+a[NR/2+1])/2 }')
     [[ -z "$median" ]] && return
     _step_time_record "$wl" "$arch" "$world" "$median"
-    info "Cached measured step-time: ${median}s/step → $MLPERF_STEP_CACHE"
+    info "Cached measured step-time: ${median}s/step (key='$picked', n=$n) → $MLPERF_STEP_CACHE"
 }
 
 _fmt_duration() {
