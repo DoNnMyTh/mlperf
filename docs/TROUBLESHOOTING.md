@@ -25,6 +25,7 @@ Live matrix of real failures operators have hit and how to unblock.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `OutOfMemoryError` in optimizer setup | GPU VRAM < ~80 GB | Use the custom smoke path; real 8B needs H100+ |
+| `OutOfMemoryError: … private pools (e.g., CUDA Graphs)` on 4×H200 preview | `run.sub` / upstream chain sources `config_common_cg.sh` (private pool ~96 GiB) | Use **docker launcher (recommended)** — preview-safe. Sbatch/srun containerized paths are blocked in preview because upstream run.sub sources cg.sh unconditionally. Override: `MLPERF_FORCE_SBATCH_PREVIEW=1` only after patching run.sub. |
 | `pipeline-model-parallel size should be greater than 1 with interleaved schedule` | `INTERLEAVED_PIPELINE != 0` with PP=1 | Custom smoke sets `INTERLEAVED_PIPELINE=0`; for real configs verify matching topology |
 | `Can not use sequence parallelism without tensor parallelism` | TP=1 with `SEQ_PARALLEL=True` | Custom smoke sets `SEQ_PARALLEL=False`; for real configs verify topology |
 | Training hangs at "init NCCL" | Fabric manager down (NVSwitch) or IB link down | `systemctl status nvidia-fabricmanager`; `ibstat`; run `tools/provision/fabric.sh` |

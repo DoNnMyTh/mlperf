@@ -1033,6 +1033,14 @@ CFG_FILE=""; IS_CUSTOM=0; AUTO_CFG=""
 run_mode="${MLPERF_RUN_MODE:-preview}"
 topo="${MLPERF_TOPOLOGY:-auto}"
 
+# Preview skips upstream config_common_cg.sh (CUDA-graph private pool ~96
+# GiB) across every launcher. Wrappers source cg.sh BEFORE CFG_FILE, so
+# AUTO's skip in its own chain is insufficient without this host-side
+# flag forwarded via -e / --export.
+if [[ "$run_mode" == "preview" ]]; then
+    export MLPERF_SKIP_CG=1
+fi
+
 case "$topo" in
     advanced)
         mapfile -t CONFIGS < <(ls $WL_CONFIG_GLOB 2>/dev/null | grep -Ev "$WL_CONFIG_EXCLUDE_RE" || true)
@@ -1380,24 +1388,34 @@ info "Detected: sbatch=$HAS_SBATCH srun=$HAS_SRUN enroot=$HAS_ENROOT docker=$NEE
 OPTS=(); KEYS=()
 add_opt(){ OPTS+=("$1"); KEYS+=("$2"); }
 
+# Docker first when on non-login, image present — recommended for preview
+# and day-to-day. Upstream run.sub (sbatch containerized) sources
+# config_common_cg.sh unconditionally, so MLPERF_SKIP_CG cannot reach the
+# training process through that path — preview OOMs there. Docker wrapper
+# is under our control and honors MLPERF_SKIP_CG gate.
+_preview_safe=""
+[[ "$run_mode" == "preview" ]] && _preview_safe=" — preview-safe"
+_preview_unsafe=""
+[[ "$run_mode" == "preview" ]] && _preview_unsafe=" — NOT preview-safe (cg.sh forced)"
+
+if (( RUN_ON_LOGIN_NODE == 0 )); then
+    [[ -n "$IMAGE" ]] && add_opt "docker run (single-node, RECOMMENDED${_preview_safe})" "docker"
+    (( BARE_OK == 1 )) && add_opt "bare-metal torchrun (single-node${_preview_safe})" "bare"
+    if (( IS_CUSTOM == 0 && BARE_OK == 1 )); then
+        add_opt "bare-metal torchrun multi-node (no Slurm${_preview_safe})" "bare_multi"
+    fi
+fi
 if (( HAS_SBATCH == 1 && IS_CUSTOM == 0 )) && [[ -n "$CONT_REF" ]]; then
-    add_opt "sbatch run.sub (Slurm+Pyxis+Enroot, containerized)" "sbatch"
+    add_opt "sbatch run.sub (Slurm+Pyxis+Enroot, containerized${_preview_unsafe})" "sbatch"
 fi
 if (( HAS_SRUN == 1 && HAS_ENROOT == 1 && IS_CUSTOM == 0 )) && [[ -n "$CONT_REF" ]]; then
-    add_opt "srun + Pyxis/Enroot (interactive)" "srun"
+    add_opt "srun + Pyxis/Enroot (interactive${_preview_unsafe})" "srun"
 fi
 if (( HAS_SBATCH == 1 && IS_CUSTOM == 0 && BARE_OK == 1 )); then
-    add_opt "sbatch bare-metal (Slurm, no container)" "sbatch_bare"
+    add_opt "sbatch bare-metal (Slurm, no container${_preview_safe})" "sbatch_bare"
 fi
 if (( HAS_SRUN == 1 && IS_CUSTOM == 0 && BARE_OK == 1 )); then
-    add_opt "srun bare-metal (Slurm, no container)" "srun_bare"
-fi
-if (( RUN_ON_LOGIN_NODE == 0 )); then
-    [[ -n "$IMAGE" ]] && add_opt "docker run (single-node)" "docker"
-    (( BARE_OK == 1 )) && add_opt "bare-metal torchrun (single-node)" "bare"
-    if (( IS_CUSTOM == 0 && BARE_OK == 1 )); then
-        add_opt "bare-metal torchrun multi-node (no Slurm)" "bare_multi"
-    fi
+    add_opt "srun bare-metal (Slurm, no container${_preview_safe})" "srun_bare"
 fi
 if (( IS_CUSTOM == 1 )); then
     OPTS=(); KEYS=()
@@ -1434,6 +1452,7 @@ docker_common_args=(
     # activation footprint jumps step-to-step. Upstream prints this tip
     # on OOM; setting it pre-emptively avoids the retry cycle.
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    -e MLPERF_SKIP_CG="${MLPERF_SKIP_CG:-0}"
 )
 if [[ -n "$WL_TOKENIZER_HOST_SUBPATH" && -n "$WL_TOKENIZER_MOUNT" ]]; then
     docker_common_args+=(-v "$DATADIR/$WL_TOKENIZER_HOST_SUBPATH:$WL_TOKENIZER_MOUNT:ro")
@@ -1598,7 +1617,9 @@ EOF
 # Re-source common configs and the picked config inside subshell to be safe.
 source_configs() {
     set +u
+    local f
     for f in config_common.sh config_common_cg.sh config_common_8b.sh; do
+        [[ "$f" == config_common_cg.sh && "${MLPERF_SKIP_CG:-0}" == "1" ]] && continue
         [[ -f "$f" ]] && source "$f"
     done
     [[ -n "$CFG_FILE" && -f "$CFG_FILE" ]] && source "$CFG_FILE"
@@ -1700,6 +1721,14 @@ case "$METHOD" in
     sbatch)
         [[ -n "$CONT_REF" ]] \
             || die "sbatch needs a container ref (CONT_REF). Re-run Step 2 and provide a pyxis-style ref (docker://... or /path/to/image.sqsh)."
+        # Upstream run.sub chains config_common_cg.sh regardless of env. For
+        # preview mode this re-enables CUDA-graph private pool (~96 GiB) →
+        # OOM on ≤4×H200. Block unless user explicitly forces.
+        if [[ "$run_mode" == "preview" && "${MLPERF_FORCE_SBATCH_PREVIEW:-0}" != "1" ]]; then
+            err "sbatch containerized path is NOT preview-safe — run.sub sources config_common_cg.sh unconditionally (CUDA-graph ~96 GiB → OOM on 4×H200)."
+            err "Use docker (RECOMMENDED) or sbatch_bare for preview; or set MLPERF_RUN_MODE=full for compliance."
+            die "Override with MLPERF_FORCE_SBATCH_PREVIEW=1 only if you patched run.sub."
+        fi
         ACCOUNT="$(ask 'Slurm --account (blank to skip)' "${AUTO_SLURM_ACCOUNT:-}")"
         PARTITION="$(ask 'Slurm --partition (blank to skip)' "${AUTO_SLURM_PARTITION:-}")"
         RESERVATION="$(ask 'Slurm --reservation (blank to skip)' '')"
@@ -1709,13 +1738,19 @@ case "$METHOD" in
         [[ -n "$PARTITION" ]]   && ARGS+=(--partition="$PARTITION")
         [[ -n "$RESERVATION" ]] && ARGS+=(--reservation="$RESERVATION")
         _rec_export=$(build_recipe_export_list)
-        [[ -n "$_rec_export" ]] && ARGS+=(--export="ALL,$_rec_export")
+        _ex="ALL,MLPERF_SKIP_CG=${MLPERF_SKIP_CG:-0}"
+        [[ -n "$_rec_export" ]] && _ex="$_ex,$_rec_export"
+        ARGS+=(--export="$_ex")
         CONT="$CONT_REF" DATADIR="$DATADIR" LOGDIR="$LOGDIR" SEED="$SEED" NEXP="$NEXP" \
             sbatch "${ARGS[@]}" run.sub
         ;;
     srun)
         [[ -n "$CONT_REF" ]] \
             || die "srun needs a container ref (CONT_REF). Re-run Step 2 and provide a pyxis-style ref."
+        if [[ "$run_mode" == "preview" && "${MLPERF_FORCE_SBATCH_PREVIEW:-0}" != "1" ]]; then
+            err "srun containerized path is NOT preview-safe (same cg.sh issue as sbatch)."
+            die "Use docker (RECOMMENDED) or srun_bare for preview."
+        fi
         NODES="$(ask 'Nodes (-N)' "$DGXNNODES")"
         NTPN="$(ask 'ntasks-per-node' "$DGXNGPU")"
         GPUS="$(ask 'gpus-per-task' 1)"
@@ -1732,7 +1767,7 @@ case "$METHOD" in
     sbatch_bare)
         ACCOUNT="$(ask 'Slurm --account (blank to skip)' "${AUTO_SLURM_ACCOUNT:-}")"
         PARTITION="$(ask 'Slurm --partition (blank to skip)' "${AUTO_SLURM_PARTITION:-}")"
-        WRAP="cd '$IMPL_DIR' && source config_common.sh && [[ -f config_common_cg.sh ]] && source config_common_cg.sh; [[ -f config_common_8b.sh ]] && source config_common_8b.sh; source '$CFG_FILE' && bash $WL_ENTRY"
+        WRAP="cd '$IMPL_DIR' && source config_common.sh && { [[ \"\${MLPERF_SKIP_CG:-0}\" != 1 && -f config_common_cg.sh ]] && source config_common_cg.sh; }; [[ -f config_common_8b.sh ]] && source config_common_8b.sh; source '$CFG_FILE' && bash $WL_ENTRY"
         ARGS=(-N "$DGXNNODES" --ntasks-per-node="$DGXNGPU" --gpus-per-task=1 --time="$WALLTIME")
         [[ -n "$ACCOUNT" ]]   && ARGS+=(--account="$ACCOUNT")
         [[ -n "$PARTITION" ]] && ARGS+=(--partition="$PARTITION")
@@ -1774,7 +1809,7 @@ case "$METHOD" in
                 set -e
                 cd $WL_CONTAINER_WORKDIR
                 [ -f config_common.sh ]    && source config_common.sh    || true
-                [ -f config_common_cg.sh ] && source config_common_cg.sh || true
+                if [ \"\${MLPERF_SKIP_CG:-0}\" != 1 ] && [ -f config_common_cg.sh ]; then source config_common_cg.sh; fi
                 [ -f config_common_8b.sh ] && source config_common_8b.sh || true
                 source ${CFG_IN_CONTAINER:-$CFG_FILE}
                 export DGXNGPU=$NGPU DGXNNODES=1 BINDCMD=''
@@ -1832,7 +1867,7 @@ PY
                 export PYTHONPATH=/tmp/mlperf_smoke_patch:\${PYTHONPATH:-}
                 cd $WL_CONTAINER_WORKDIR
                 [ -f config_common.sh ]    && source config_common.sh    || true
-                [ -f config_common_cg.sh ] && source config_common_cg.sh || true
+                if [ \"\${MLPERF_SKIP_CG:-0}\" != 1 ] && [ -f config_common_cg.sh ]; then source config_common_cg.sh; fi
                 [ -f config_common_8b.sh ] && source config_common_8b.sh || true
                 export $SMOKE_STR
                 bash $WL_ENTRY
